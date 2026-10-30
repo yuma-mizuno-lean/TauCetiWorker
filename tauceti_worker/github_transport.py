@@ -1101,6 +1101,9 @@ def migrated_identity(args):
 
 
 def proxy_readonly(args):
+    # Watching a run never publishes, including --exit-status on a failed run.
+    if args[:2] == ["run", "watch"]:
+        return True
     if len(args) > 1 and args[0] == "search" and args[1] in ("code", "commits", "issues", "prs", "repos"):
         return True
     if args[:1] == ["api"]:

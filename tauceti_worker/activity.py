@@ -336,11 +336,13 @@ def backfill(db, history_roots=()):
 def _clean_history(db):
     # Pin the start once, using the first native lifecycle receipt. Preserve event
     # deduplication tombstones so replaying a journal cannot restore discarded facts.
-    db.execute("""
-      INSERT OR IGNORE INTO meta(key,value)
-      SELECT 'history_cutoff', MIN(COALESCE(started,finished)) FROM rounds
-      WHERE id NOT LIKE 'resource:%' HAVING MIN(COALESCE(started,finished)) IS NOT NULL
-    """)
+    first = db.execute("""
+      SELECT MIN(COALESCE(started,finished)) FROM rounds WHERE id NOT LIKE 'resource:%'
+    """).fetchone()[0]
+    if first is not None:
+        # SQLite's implicit REAL -> TEXT conversion rounds epoch fractions. A
+        # rounded-up cutoff deletes the very first receipt it was derived from.
+        db.execute("INSERT OR IGNORE INTO meta VALUES ('history_cutoff', ?)", (repr(first),))
     db.execute("DELETE FROM rounds WHERE id LIKE 'resource:%'")
     cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     if cutoff:

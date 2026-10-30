@@ -1320,6 +1320,42 @@ def lake_cache_max_revs(env: dict) -> str:
     return value
 
 
+def dependency_cache_requests(cwd: Path):
+    """Use trusted project endpoints with the checkout's exact dependency pins."""
+    dependencies = [d for d in json.loads(os.environ.get("TAUCETI_UPSTREAMS", "[]")) if d.get("cache_artifact_url")]
+    if not dependencies:
+        return []
+    packages = {p["name"]: p for p in json.loads((cwd / "lake-manifest.json").read_text())["packages"]}
+    requests = []
+    for index, dep in enumerate(dependencies):
+        package = packages.get(dep["package"])
+        if not package or package.get("url", "").removesuffix(".git") != "https://github.com/" + dep["repo"]:
+            raise Die("dependency cache repository does not match manifest")
+        requests.append((f"dependency-{index}", dep, package["rev"]))
+    return requests
+
+
+def lake_cache_configuration(cwd: Path) -> str:
+    text = (
+        f'[[cache.service]]\nname = "{TAUCETI_CACHE_SERVICE}"\nkind = "s3"\n'
+        f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\n'
+        f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
+    )
+    for service, dep, _revision in dependency_cache_requests(cwd):
+        text += (
+            "\n[[cache.service]]\nname = "
+            + json.dumps(service)
+            + '\nkind = "s3"\n'
+            + "artifactEndpoint = "
+            + json.dumps(dep["cache_artifact_url"])
+            + "\n"
+            + "revisionEndpoint = "
+            + json.dumps(dep["cache_revision_url"])
+            + "\n"
+        )
+    return text
+
+
 @contextlib.contextmanager
 def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
     """Keep the public service available through repairs, merges and dependency changes."""
@@ -1331,11 +1367,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         return
     with tempfile.TemporaryDirectory(prefix="tauceti-lake-config-") as tmp:
         config = Path(tmp) / "lake.toml"
-        config.write_text(
-            f'[[cache.service]]\nname = "{TAUCETI_CACHE_SERVICE}"\nkind = "s3"\n'
-            f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\n'
-            f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
-        )
+        config.write_text(lake_cache_configuration(cwd))
         env["LAKE_CONFIG"] = str(config)
         env.pop("TAUCETI_PR_CACHE_MISS", None)
         env.setdefault("LAKE_ARTIFACT_CACHE", "1")
@@ -1364,6 +1396,22 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             ) from error
 
 
+class OptionalPublicCacheUnavailable(BuildCacheUnavailable):
+    """The explicitly optional project cache failed; dependency preparation still passed."""
+
+
+def _host_public_cache_policy() -> bool:
+    from tauceti_tools.project import active
+
+    project = active()
+    return bool(project and project.content == TAUCETI and project.service("cache").get("worker_public") is True)
+
+
+def _host_cache_max_revs(env: dict) -> str:
+    value = lake_cache_max_revs(env)
+    return str(min(int(value) or 20, 20)) if _host_public_cache_policy() else value
+
+
 def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
     """Fetch and hydrate shared artifacts before either normal work or recovery verification."""
     from . import expanded_cache
@@ -1382,7 +1430,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
                 TAUCETI_CACHE_SERVICE,
                 "--repo",
                 TAUCETI,
-                f"--max-revs={lake_cache_max_revs(warm)}",
+                f"--max-revs={_host_cache_max_revs(warm)}",
             ],
             cwd,
             warm,
@@ -1390,7 +1438,12 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
             30,
         ),
     ) as warm_env:
-        warm_host_build_caches(cwd, warm_env, logdir)
+        try:
+            warm_host_build_caches(cwd, warm_env, logdir)
+        except OptionalPublicCacheUnavailable:
+            warm_env["LAKE_NO_CACHE"] = "true"
+            env["LAKE_NO_CACHE"] = "true"
+            log("host build caches: optional public cache unavailable; reuse local outputs and build missing outputs")
 
 
 def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
@@ -1446,17 +1499,21 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
     """Fetch both caches on the selected branch; warm main too for subsequent rebases.
 
     Genuine workspace errors must reach repair agents. Transport, publication and partial-download
-    failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
+    dependency failures stop before an agent starts. An explicitly optional root cache
+    can fall back to local compilation. Lake verifies and atomically installs artifacts, so retries
     retain successful downloads. All fetches together have one twenty-minute deadline.
     """
     prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
-    max_revs = lake_cache_max_revs(env)
+    max_revs = _host_cache_max_revs(env)
+    optional_root = False
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
     deadline = time.monotonic() + HOST_CACHE_TIMEOUT
     log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
 
     def unavailable(reason: str):
+        if optional_root:
+            raise OptionalPublicCacheUnavailable(f"{reason}; optional root cache fallback (see {logf})", log_file=logf)
         message = f"{reason}; agent not started (see {logf})"
         log(message)
         report_failure(message, code=75, log_file=logf)
@@ -1472,7 +1529,9 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
                 output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
                 output.flush()
                 try:
-                    rc = _cache_fetch([*prefix, *command], cwd, env, output, remaining)
+                    rc = _cache_fetch(
+                        [*prefix, *command], cwd, env, output, min(remaining, 120) if optional_root else remaining
+                    )
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1
@@ -1519,6 +1578,8 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
                 r"^error:.*(?:no outputs found|outputs not found for revision)", detail, re.M
             ):
                 return "miss"
+            if optional_root:
+                unavailable(f"{label} optional cache unavailable; no immediate retry")
             if attempt == 1:
                 log(f"host build caches: {label} fetch failed; retrying verified downloads")
                 continue
@@ -1573,6 +1634,29 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
     if not TAUCETI_CACHE_SERVICE:
         return
     base = ["lake", "cache", "get", "--service", TAUCETI_CACHE_SERVICE, "--repo", TAUCETI]
+    for service, dep, revision in dependency_cache_requests(cwd):
+        result = fetch(
+            dep["package"],
+            [
+                "lake",
+                "cache",
+                "get",
+                "--service",
+                service,
+                "--repo",
+                dep["repo"],
+                "--package",
+                dep["package"],
+                "--rev",
+                revision,
+                "--max-revs=1",
+            ],
+        )
+        if result != "ready":
+            if result == "workspace-error":
+                return
+            unavailable("dependency cache unavailable for " + dep["repo"] + " at " + revision)
+    optional_root = _host_public_cache_policy()
     result = fetch("TauCeti", [*base, f"--max-revs={max_revs}"])
     if result == "workspace-error":
         return

@@ -50,6 +50,18 @@ class ActivityTests(unittest.TestCase):
         with patch.object(a.time, "time", return_value=self.now - age):
             a.emit("round_finished", key=rid, round_id=rid, round_type=kind, outcome=outcome)
 
+    def test_history_cutoff_preserves_epoch_precision_and_first_receipt(self):
+        epoch = 1793343000.123456
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute(
+                "INSERT INTO rounds(id,worker,scope,kind,finished,outcome) VALUES ('first','worker','machine','review',?,'completed')",
+                (epoch,),
+            )
+            a._clean_history(db)
+            cutoff = float(db.execute("SELECT value FROM meta WHERE key='history_cutoff'").fetchone()[0])
+            self.assertEqual(cutoff, epoch)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM rounds WHERE id='first'").fetchone()[0], 1)
+
     def test_upgrade_preserves_usage_history_and_ignores_old_containment_projection(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("CREATE TABLE containment(boundary TEXT PRIMARY KEY, cleanup TEXT)")

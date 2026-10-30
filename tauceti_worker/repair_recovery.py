@@ -1134,21 +1134,20 @@ class WorkerBackend:
     def verification_environment(self, checkout):
         if not any((checkout / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
             return {}
-        from .agents import TAUCETI_CACHE_ARTIFACT_URL, TAUCETI_CACHE_REVISION_URL, TAUCETI_CACHE_SERVICE
+        from .agents import TAUCETI_CACHE_SERVICE, lake_cache_configuration
 
         if not TAUCETI_CACHE_SERVICE:
             return {}
         config = checkout.parent / "verification-lake.toml"
-        if not config.exists():
-            saved._write(
-                config,
-                (
-                    f'[[cache.service]]\nname = "{TAUCETI_CACHE_SERVICE}"\nkind = "s3"\n'
-                    f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\n'
-                    f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
-                ).encode(),
-            )
-            saved._fsync_dir(config.parent)
+        content = lake_cache_configuration(checkout).encode()
+        if not config.exists() or config.read_bytes() != content:
+            temporary = config.with_name(config.name + "." + uuid.uuid4().hex)
+            try:
+                saved._write(temporary, content)
+                os.replace(temporary, config)
+                saved._fsync_dir(config.parent)
+            finally:
+                temporary.unlink(missing_ok=True)
         return dict(
             LAKE_CONFIG=str(config),
             LAKE_ARTIFACT_CACHE=os.environ.get("LAKE_ARTIFACT_CACHE", "1"),

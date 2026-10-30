@@ -51,6 +51,64 @@ class Cache(unittest.TestCase):
             prepare_host_build_caches(self.root, env, self.root / "logs")
         self.assertEqual(events, ["prepare", "fetch", "hydrate"])
 
+    def test_mei_revision_reuse_and_shared_hydration(self):
+        env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
+        revision = self.pool / "revisions/Mei" / ("a" * 40 + ".jsonl")
+        revision.parent.mkdir(parents=True)
+        revision.write_text("{}\n")
+        with cache.preparation(self.root, env) as warm:
+            download = Path(warm["LAKE_CACHE_DIR"])
+            self.assertEqual((download / "revisions/Mei" / revision.name).read_text(), "{}\n")
+        entry = self.pool / "entries" / ("b" * 16)
+        entry.mkdir(parents=True)
+        data = dict(o=["c" * 16 + ".olean"], i="d" * 16 + ".ilean")
+        for name in cache.descriptions(data):
+            (entry / name).write_bytes(b"verified")
+        atomic_json(entry / "entry.json", dict(data=data))
+        cache.hydrate(entry, self.root / "private", "e" * 16, "Mei")
+        self.assertTrue((self.root / "private/outputs/Mei" / ("e" * 16 + ".json")).exists())
+
+    def test_public_optin_overrides_ci_bundle_and_outage_continues(self):
+        from types import SimpleNamespace
+
+        from tauceti_worker import agents
+
+        project = SimpleNamespace(content=agents.TAUCETI, service=lambda _: dict(ci_bundle=True, worker_public=True))
+        env = dict(TAUCETI_SHARED_ARTIFACTS="0")
+        with patch("tauceti_tools.project.active", return_value=project):
+            self.assertTrue(agents._host_public_cache_policy())
+            with patch.object(
+                agents,
+                "warm_host_build_caches",
+                side_effect=agents.OptionalPublicCacheUnavailable("503", log_file=self.root / "log"),
+            ):
+                agents.prepare_host_build_caches(self.root, env, self.root / "logs")
+        self.assertEqual(env["LAKE_NO_CACHE"], "true")
+
+    def test_two_archives_sharing_a_lock_slot_are_both_reused(self):
+        import hashlib
+
+        slots = {}
+        for n in range(10000):
+            key = f"{n:016x}"
+            slot = hashlib.sha256(key.encode()).hexdigest()[:3]
+            if slot in slots:
+                keys = [slots[slot], key]
+                break
+            slots[slot] = key
+        data = dict(o=["a" * 16 + ".olean"], i="b" * 16 + ".ilean")
+        download = self.root / "downloads"
+        for n, key in enumerate(keys):
+            entry = self.pool / "entries" / key
+            entry.mkdir(parents=True)
+            for name in cache.descriptions(data):
+                (entry / name).write_bytes(b"verified")
+            atomic_json(entry / "entry.json", dict(data=data))
+            atomic_json(download / "outputs/Mei" / (f"{n:016x}.json"), dict(data=key + ".ltar"))
+        report = dict(hits=0, expanded=0)
+        cache.expand(download, self.root / "private", self.root, {}, self.pool, report, "Mei")
+        self.assertEqual(report, dict(hits=2, expanded=0))
+
     def test_reject_unsafe_and_incomplete_descriptions(self):
         for data in [{}, {"o": ["../../foreign"], "i": "a" * 16 + ".ilean"}, {"o": ["a" * 16 + ".olean"]}]:
             with self.assertRaises(ValueError):

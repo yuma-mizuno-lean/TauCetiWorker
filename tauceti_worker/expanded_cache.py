@@ -174,10 +174,10 @@ def descriptions(data):
     return result
 
 
-def entries(download):
+def entries(download, package="TauCeti"):
     # A fresh download directory has no locally compiled output mappings. Every .ltar
     # mapping here came from the existing trusted CI service during this preparation.
-    for path in (download / "outputs/TauCeti").glob("*.json"):
+    for path in (download / "outputs" / package).glob("*.json"):
         if not HASH.fullmatch(path.stem):
             continue
         data = read_json(path).get("data")
@@ -185,7 +185,7 @@ def entries(download):
             yield path.stem, data
 
 
-def hydrate(entry, private, input_hash):
+def hydrate(entry, private, input_hash, package="TauCeti"):
     row = read_json(entry / "entry.json")
     names = descriptions(row["data"])
     if not all((entry / name).is_file() and not (entry / name).is_symlink() for name in names):
@@ -193,21 +193,21 @@ def hydrate(entry, private, input_hash):
     desired = dict(schemaVersion=SCHEMA, service=None, data=row["data"])
     keys = input_hash if isinstance(input_hash, list) else [input_hash]
     if not (
-        all(read_json(private / "outputs/TauCeti" / (key + ".json")) == desired for key in keys)
+        all(read_json(private / "outputs" / package / (key + ".json")) == desired for key in keys)
         and all((private / "artifacts" / name).is_file() for name in names)
     ):
         for name in names:
             link(entry / name, private / "artifacts" / name)
         for key in keys:
-            atomic_json(private / "outputs/TauCeti" / (key + ".json"), desired)
+            atomic_json(private / "outputs" / package / (key + ".json"), desired)
     # Explicit reuse timestamp: archive mtimes and filesystem atime are not LRU.
     if time.time() - (entry / "entry.json").stat().st_mtime > 60:
         os.utime(entry / "entry.json", None)
 
 
-def expand(download, private, cwd, env, pool, report):
+def expand(download, private, cwd, env, pool, report, package="TauCeti"):
     grouped = {}
-    for input_hash, archive in entries(download):
+    for input_hash, archive in entries(download, package):
         grouped.setdefault(archive, []).append(input_hash)
     pending = [(inputs, archive) for archive, inputs in grouped.items()]
     if not pending:
@@ -219,16 +219,20 @@ def expand(download, private, cwd, env, pool, report):
             break
         with contextlib.ExitStack() as stack:
             missing = []
+            held_slots = set()
             for input_hash, archive in pending[offset : offset + 128]:
                 key = archive[:-5]
                 try:
-                    stack.enter_context(locked(pool, key))
+                    slot = hashlib.sha256(key.encode()).hexdigest()[:3]
+                    if slot not in held_slots:
+                        stack.enter_context(locked(pool, key))
+                        held_slots.add(slot)
                 except BlockingIOError:
                     continue  # Another publisher is useful work, not a reason to wait.
                 entry = pool / "entries" / key
                 try:
                     if (entry / "entry.json").is_file():
-                        hydrate(entry, private, input_hash)
+                        hydrate(entry, private, input_hash, package)
                         report["hits"] += 1
                     else:
                         missing.append((input_hash, archive, entry))
@@ -307,16 +311,18 @@ def expand(download, private, cwd, env, pool, report):
                     atomic_json(publication / "entry.json", dict(data=data))
                     entry.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(publication, entry)
-                    hydrate(entry, private, input_hash)
+                    hydrate(entry, private, input_hash, package)
                     report["expanded"] += 1
 
 
 def transfer(download, private, seeded=()):
     """Preserve downloads on unsupported toolchains, without linking mutable metadata."""
     try:
-        wanted = {name for _, name in entries(download)}
-        for mapping in (download / "outputs/TauCeti").glob("*.json"):
+        wanted = set()
+        for mapping in (download / "outputs").glob("*/*.json"):
             data = read_json(mapping).get("data")
+            if isinstance(data, str) and ARTIFACT.fullmatch(data):
+                wanted.add(data)
             if isinstance(data, dict):
                 with contextlib.suppress(ValueError):
                     wanted.update(descriptions(data))
@@ -379,10 +385,10 @@ def preparation(cwd, env, *, refetch=None):
                         link(path, download / "artifacts" / path.name)
                         seeded.add(path.name)
             # Reuse only the host-owned immutable revision maps, never agent-created metadata.
-            revisions = pool / "revisions/TauCeti"
-            recent = sorted(revisions.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:64]
+            revisions = pool / "revisions"
+            recent = sorted(revisions.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:64]
             for path in recent:
-                link(path, download / "revisions/TauCeti" / path.name)
+                link(path, download / "revisions" / path.relative_to(revisions))
         except (OSError, ValueError) as error:
             log(f"expanded cache setup unavailable; using private cache ({error})")
             yield env
@@ -398,18 +404,20 @@ def preparation(cwd, env, *, refetch=None):
             transfer(download, private, seeded)
             if ready:
                 with contextlib.suppress(OSError):
-                    for path in (download / "revisions/TauCeti").glob("*.jsonl"):
+                    for path in (download / "revisions").glob("*/*.jsonl"):
                         if not path.is_symlink():
-                            link(path, pool / "revisions/TauCeti" / path.name)
+                            link(path, pool / "revisions" / path.relative_to(download / "revisions"))
                     revisions = sorted(
-                        (pool / "revisions/TauCeti").glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
+                        (pool / "revisions").glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
                     )
                     for old in revisions[64:]:
                         old.unlink(missing_ok=True)
             if ready and env.get("LAKE_ARTIFACT_CACHE", "1").lower() not in ("0", "false", "off"):
                 try:
                     try:
-                        expand(download, private, cwd, warm_env, pool, report)
+                        for package_dir in (download / "outputs").iterdir() if (download / "outputs").exists() else []:
+                            if package_dir.is_dir() and not package_dir.is_symlink():
+                                expand(download, private, cwd, warm_env, pool, report, package_dir.name)
                     except CorruptArchive as error:
                         # A stale local .ltar must not poison every future round. Detach
                         # the known-bad candidate and let the existing downloader repair it.
@@ -418,7 +426,11 @@ def preparation(cwd, env, *, refetch=None):
                         if refetch is not None:
                             refetch(warm_env)
                             transfer(download, private, seeded)
-                            expand(download, private, cwd, warm_env, pool, report)
+                            for package_dir in (
+                                (download / "outputs").iterdir() if (download / "outputs").exists() else []
+                            ):
+                                if package_dir.is_dir() and not package_dir.is_symlink():
+                                    expand(download, private, cwd, warm_env, pool, report, package_dir.name)
                 except Exception as error:
                     # Sharing is an optimization; report its failure without spending a
                     # PR attempt or replacing the original host-preparation outcome.

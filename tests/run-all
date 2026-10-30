@@ -72,6 +72,7 @@ RUN_STDLIB=(
   github_failure_reason.py
   github_ratelimit.py
   github_shared_transport.py
+  github_run_watch.py
   github_cli_metadata.py
   github_throughput.py
   github_state.py
@@ -101,6 +102,7 @@ RUN_STDLIB=(
   mirror_creds.py
   mirror_creds_macos.py
   oauth_refresh_loop.py
+  oauth_user_agent.py
   observability_failures.py
   open_pr_pages.py
   overlaps.py

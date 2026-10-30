@@ -129,6 +129,38 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert all(r["cwd"] == str(co) for r in records)
     print("[OK] both caches fetched before launch in the selected workspace")
 
+    dependency = dict(
+        repo="example/Dependency",
+        package="Dependency",
+        cache_artifact_url="https://cache.example.org/artifacts",
+        cache_revision_url="https://cache.example.org/revisions",
+    )
+    manifest = co / "lake-manifest.json"
+    manifest.write_text(
+        json.dumps(dict(packages=[dict(name="Dependency", url="https://github.com/example/Dependency", rev="d" * 40)]))
+    )
+    rc, records, _ = run(TAUCETI_UPSTREAMS=json.dumps([dependency]))
+    assert rc == 0 and len(launched) == 1 and len(records) == 3
+    assert "--package" in records[1]["args"]
+    assert "d" * 40 in records[1]["args"] and "--max-revs=1" in records[1]["args"]
+    assert "cache.example.org/artifacts" in records[1]["config"]
+    from tauceti_worker.repair_recovery import WorkerBackend
+
+    config = co.parent / "verification-lake.toml"
+    config.write_text('[[cache.service]]\nname = "obsolete"\n')
+    with patch.dict(os.environ, {"TAUCETI_UPSTREAMS": json.dumps([dependency])}):
+        recovery_env = WorkerBackend.verification_environment(None, co)
+    assert recovery_env["LAKE_CONFIG"] == str(config)
+    assert 'name = "dependency-0"' in config.read_text()
+    assert 'name = "obsolete"' not in config.read_text()
+    manifest.write_text(
+        json.dumps(dict(packages=[dict(name="Dependency", url="https://github.com/attacker/Dependency", rev="d" * 40)]))
+    )
+    rc, records, _ = run(TAUCETI_UPSTREAMS=json.dumps([dependency]))
+    assert rc == 1 and not launched and not records
+    manifest.unlink()
+    print("[OK] dependency cache uses exact trusted repository pin before agent launch")
+
     for label in ("Mathlib", "TauCeti"):
         rc, records, _ = run(label + "-retry")
         assert rc == 0 and len(launched) == 1
@@ -279,6 +311,26 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         assert rc == 0, text
         assert not any(r["args"] == ["exe", "cache", "clean"] for r in records)
     print("[OK] Mathlib prunes stale private archive links once daily and records current-tree pool reuse")
+
+    from tauceti_tools import project as project_config
+
+    policy = SimpleNamespace(content=agents.TAUCETI, service=lambda name: {"ci_bundle": True, "worker_public": True})
+    with patch.object(project_config, "active", return_value=policy):
+        rc, records, output = run("TauCeti-fail")
+        assert rc == 0 and len(launched) == 1, output
+        assert sum(r["label"] == "TauCeti" for r in records) == 1, records
+        assert "optional public cache unavailable" in output
+        rc, records, output = run("Mathlib-fail")
+        assert rc == 75 and not launched, output
+        manifest.write_text(
+            json.dumps(
+                dict(packages=[dict(name="Dependency", url="https://github.com/example/Dependency", rev="d" * 40)])
+            )
+        )
+        rc, records, output = run("TauCeti-fail", TAUCETI_UPSTREAMS=json.dumps([dependency]))
+        assert rc == 75 and not launched, output
+        manifest.unlink()
+    print("[OK] optional root outage continues once; dependency outages still stop admission")
 
     waits = []
     signals = []
