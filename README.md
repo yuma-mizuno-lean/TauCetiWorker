@@ -1,3 +1,11 @@
+# Mei-compatible Tau Ceti Worker fork
+
+This is a downstream fork of [TauCetiProject/TauCetiWorker](https://github.com/TauCetiProject/TauCetiWorker).
+It keeps the upstream worker and adds the minimal cache and reliability fixes
+used by Mei. Start with the [Mei setup and maintenance guide](docs/mei.md).
+Every operator supplies their own GitHub and agent authentication. This repository
+does not contain the maintainer's worker configuration, credentials, logs or build caches.
+
 Generic project configuration is provided by [TauCetiTools](https://github.com/TauCetiProject/TauCetiTools).
 This repository remains an example worker harness. Pass the same configuration to work and review commands:
 
@@ -31,10 +39,10 @@ From there you launch whatever you want. Pin a worker to one kind of work with
 and let it pick the most useful job each round until you stop it.
 
 It runs as your authenticated `gh` account: you set up `gh auth`, the worker acts
-as that account, and it treats that account's own PRs as the ones it tends. The
-repo is hardwired to `TauCetiProject/TauCeti`. This is an operator's tool for that
-project, not a general framework. You author through **your own fork**: the worker
-forks `TauCetiProject/TauCeti` once, automatically, pushes authored branches and
+as that account, and it treats that account's own PRs as the ones it tends. Without `--conf`, the
+default project is `TauCetiProject/TauCeti`; pass a project configuration to target
+Mei or another configured project. You author through **your own fork**: the worker
+creates or uses a fork of the configured repository, pushes authored branches and
 fixes there, and opens PRs from it, so you do **not** need write access to the
 canonical repo. (A fine-grained token scoped only to the canonical repo is not
 enough.) Set `TAUCETI_FORK=<owner>/<repo>` to use an existing fork instead.

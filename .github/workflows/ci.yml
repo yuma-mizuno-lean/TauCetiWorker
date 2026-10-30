@@ -4,16 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    # Rebuild against moving base images and agent/install endpoints even when this repo is quiet.
-    - cron: "17 4 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Reuse existing Namespace profiles. Leaving priority unspecified keeps these
-# checks behind Bors control (priority 0) and compilation (priority 1).
+# Public fork: use standard GitHub runners without upstream Namespace access.
+permissions:
+  contents: read
 jobs:
   test:
     # Storage fixtures require native, consistent inode/device metadata.
@@ -32,9 +31,7 @@ jobs:
         run: ./tests/run-all
 
   prices:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check out the review engine's price table
@@ -55,9 +52,7 @@ jobs:
           fi
 
   lint:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -77,9 +72,7 @@ jobs:
         run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint tests/*.sh tests/run-all
 
   build:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -109,9 +102,7 @@ jobs:
           PY
 
   docker:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-8x16-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -188,36 +179,3 @@ jobs:
               tauceti-worker:ci "$provider" >"$log" 2>&1
             grep -F "$provider-refresh: waiting for" "$log"
           done
-      - name: Probe the live OAuth contracts
-        if: github.event_name == 'schedule'
-        run: |
-          docker run --rm -i --entrypoint python3 tauceti-worker:ci <<'PY'
-          import requests
-
-          probes = [
-              (
-                  "claude",
-                  "https://platform.claude.com/v1/oauth/token",
-                  {
-                      "grant_type": "refresh_token",
-                      "refresh_token": "invalid-ci-probe",
-                      "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                      "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers",
-                  },
-              ),
-              (
-                  "codex",
-                  "https://auth.openai.com/oauth/token",
-                  {
-                      "grant_type": "refresh_token",
-                      "refresh_token": "invalid-ci-probe",
-                      "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
-                  },
-              ),
-          ]
-          for name, url, payload in probes:
-              response = requests.post(url, json=payload, timeout=30)
-              assert 400 <= response.status_code < 500, (name, response.status_code)
-              assert isinstance(response.json(), dict), name
-              print(f"{name}: reachable OAuth endpoint rejected the invalid probe as expected")
-          PY
