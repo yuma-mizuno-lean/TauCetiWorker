@@ -52,7 +52,7 @@ from pathlib import Path
 from . import recovery_index
 from .config import log
 from .constants import ROADMAP, TAUCETI
-from .paths import HERE
+from .paths import HERE, canonical_candidate
 from .runtime_status import atomic_json, read_json
 
 SCHEMA = "tauceti-work-recovery/v1"
@@ -635,7 +635,10 @@ def process_owner():
     from .usage_lifecycle import identity
 
     if sys.platform != "linux":
-        return identity()
+        owner = identity()
+        if sys.platform == "darwin" and os.getsid(0) == os.getpid():
+            owner["session"] = os.getpid()
+        return owner
     fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
     owner = dict(pid=os.getpid(), start=fields[19], boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip())
     if os.getsid(0) == os.getpid():
@@ -653,7 +656,7 @@ def owner_stopped(owner):
     if sys.platform != "linux":
         from .usage_lifecycle import alive
 
-        return not alive(owner)
+        return not alive({key: value for key, value in owner.items() if key != "session"})
     if not isinstance(owner["start"], str) or not owner["start"].isdigit() or not isinstance(owner["boot"], str):
         return False
     try:
@@ -671,6 +674,42 @@ def owner_stopped(owner):
         return Path("/proc/sys/kernel/random/boot_id").is_file() and not Path(f"/proc/{pid}").exists()
     except (OSError, ValueError, TypeError, IndexError):
         return False
+
+
+def owner_session(owner):
+    """Retain a dead leader's session until reboot or positive evidence of PID reuse."""
+    import sys
+
+    if not isinstance(owner, dict):
+        raise ValueError("missing owner identity")
+    session = owner.get("session")
+    if session is None:
+        return None
+    if not isinstance(session, int) or isinstance(session, bool) or session <= 0:
+        raise ValueError("invalid owner session")
+    if sys.platform == "darwin":
+        from .usage_lifecycle import darwin_boot, darwin_process
+
+        if owner["boot"] != darwin_boot():
+            return None
+        try:
+            current, _ = darwin_process(session)
+            if os.getsid(session) == session and current["start"] != owner["start"]:
+                return None
+        except ProcessLookupError:
+            pass  # The leader may be gone while its session still has live members.
+    elif sys.platform == "linux":
+        if owner["boot"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip():
+            return None
+        try:
+            fields = Path(f"/proc/{session}/stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[3]) == session and fields[19] != owner["start"]:
+                return None
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    else:
+        raise OSError("session observations unavailable")
+    return session
 
 
 def note_owner(cfg, label: str = "TauCeti", **fields) -> bool:
@@ -1054,53 +1093,124 @@ def _set_status(record: Path, state: str, reason: str = "") -> bool:
     return True
 
 
-def live_users(repo: Path, *, session=None) -> list[str]:
-    """Processes whose cwd, root, or open files lie inside the checkout (Linux /proc; read-only).
-    Detached descendants without a live reference are outside this best-effort observation."""
+def _darwin_process_references():
+    """Read visible references, with the same per-process permission limits as Linux procfs."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+
+    result = []
+    try:
+        skip = {os.getpid()} | {process.pid for process in psutil.Process().parents()}
+        for pid in psutil.pids():
+            _charge()
+            if pid <= 0:
+                continue
+            try:
+                process = psutil.Process(pid)
+                with contextlib.suppress(psutil.Error, OSError):
+                    if process.status() in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}:
+                        continue
+                session = None
+                with contextlib.suppress(OSError):
+                    session = os.getsid(pid)
+                paths = []
+                if pid not in skip:
+                    visible = False
+                    with contextlib.suppress(psutil.Error, OSError):
+                        uids = process.uids()
+                        visible = os.geteuid() == 0 or uids.real == os.getuid() or uids.effective == os.geteuid()
+                    # Like Linux procfs, another user's private references are
+                    # outside this best-effort observation. Inspect all as root.
+                    if visible:
+                        with contextlib.suppress(psutil.Error, OSError):
+                            paths.append(process.cwd())
+                        with contextlib.suppress(psutil.Error, OSError):
+                            files = process.open_files()
+                            _charge(entries=len(files))
+                            paths.extend(item.path for item in files)
+                        # Kernel vnode paths are already canonical. Resolving them
+                        # could block on unrelated network mounts or autofs triggers.
+                result.append((str(pid), session, f"{pid} (process)", paths))
+            except (psutil.NoSuchProcess, ProcessLookupError):
+                continue  # Exits during observation are ordinary.
+            except (psutil.Error, OSError):
+                continue  # One private/disappearing process must not discard the inventory.
+    except (psutil.Error, OSError):
+        return None
+    return result
+
+
+def process_references():
+    """One read-only process inventory, reusable within a cleanup pass only."""
+    import sys
+
+    if sys.platform == "darwin":
+        return _darwin_process_references()
+    if sys.platform != "linux":
+        return None
     proc = Path("/proc")
     if not (proc / "self").exists():
-        return []
-    target = os.path.realpath(repo)
-    prefix = target.rstrip("/") + "/"
+        return None
     skip = set()
     pid = os.getpid()
-    while pid > 1:  # never report ourselves or the supervisors that started this round
+    while pid > 1:
         skip.add(pid)
         try:
             pid = int((proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
         except (OSError, ValueError, IndexError):
             break
-    found = []
+    result = []
     for entry in proc.iterdir():
-        _charge()  # deadline also bounds ownership observation during housekeeping
+        _charge()
         if not entry.name.isdigit():
             continue
-        if session is not None:
-            try:
-                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                if int(fields[3]) == session and fields[0] not in {"Z", "X"}:
-                    found.append(f"{entry.name} (owner session)")
-                    continue
-            except (OSError, ValueError, IndexError):
-                pass
-        if int(entry.name) in skip:
-            continue
-        links = [entry / "cwd", entry / "root"]
-        with contextlib.suppress(OSError):
-            links += list((entry / "fd").iterdir())
-        for link in links:
-            _charge()
-            try:
-                where = os.readlink(link)
-            except OSError:
-                continue
-            if where == target or where.startswith(prefix):
-                try:
-                    found.append(f"{entry.name} ({(entry / 'comm').read_text().strip()})")
-                except OSError:
-                    found.append(entry.name)
-                break
+        session = None
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            if fields[0] not in {"Z", "X"}:
+                session = int(fields[3])
+        except (OSError, ValueError, IndexError):
+            pass
+        paths = []
+        if int(entry.name) not in skip:
+            links = [entry / "cwd", entry / "root"]
+            with contextlib.suppress(OSError):
+                links += list((entry / "fd").iterdir())
+            for link in links:
+                _charge()
+                with contextlib.suppress(OSError):
+                    where = os.readlink(link)
+                    if where.startswith("/"):
+                        paths.append(where)
+        result.append((entry.name, session, entry.name, paths))
+    return result
+
+
+def referenced_users(repo: Path, references, *, session=None) -> list[str]:
+    if references is None:
+        return ["process observations unavailable"]
+    try:
+        target = str(canonical_candidate(repo))
+    except OSError:
+        return ["candidate path unavailable"]
+    prefix = target.rstrip("/") + "/"
+    found = []
+    for pid, process_session, label, paths in references:
+        if session is not None and process_session == session:
+            found.append(f"{pid} (owner session)")
+        elif any(where == target or where.startswith(prefix) for where in paths):
+            if label == pid:
+                with contextlib.suppress(OSError):
+                    label = f"{pid} ({(Path('/proc') / pid / 'comm').read_text().strip()})"
+            found.append(label)
     return found
+
+
+def live_users(repo: Path, *, session=None) -> list[str]:
+    """Fresh process references for ordinary callers; no cached negative liveness evidence."""
+    return referenced_users(repo, process_references(), session=session)
 
 
 # Next to the checkout, so moving aside is a same-volume rename. Not `retained`: progress parks

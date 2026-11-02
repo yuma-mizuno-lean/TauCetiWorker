@@ -166,7 +166,7 @@ A round does exactly one unit of work: the first of these that applies.
 | **Lint repair** | Fix `TauCeti/` on a red `lint-repair/` PR. PR builds lint only the modules a change touches, so TauCeti's daily full lint opens one of these when main carries environment-lint violations elsewhere (for example, a new simp lemma that takes an older one out of simp normal form). The worker never opens one itself. |
 | **Progress** | When the global eight-hour cadence is due and a roadmap has at least 25 new PRs, update its generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
 | **Fix CI** | Repair one of our PRs whose `build` check is red. It cannot be reviewed until it builds, so this comes before Fix. |
-| **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
+| **Fix** | Address current-head review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. Existing findings can be repaired while CI is pending or unavailable; a green build is not required. |
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so author-action work (`ci-failed` or `awaiting-author`) cannot be starved by unrelated reviews. |
 | **Overlap fix** | Refactor a labelled Mathlib overlap issue into a normal upstream PR, preserving additional Tau Ceti functionality. |
 | **Overlap scan** | Examine up to 160 consecutive Mathlib commits after the shared cursor, publish actionable overlaps as issues, then advance the cursor through the completed batch. |
@@ -408,6 +408,13 @@ Roadmap rounds steer toward one area, a subdirectory of the
   whole roadmap over time.
 - `--roadmap-skip <area>[,<area>...]` excludes areas from both the random pick
   and the all-areas case. `--roadmap-only` wins on overlap.
+- `--extra-roadmap-prompt <text>` adds operator guidance to the roadmap prompt, for
+  example `--extra-roadmap-prompt "Work on the material relevant to Higher Topos Theory"`.
+  It steers the choice of target within the designated roadmap, and the choice
+  of area too when `--roadmap-only ""` leaves that to the agent (an unpinned
+  worker still draws its area at random before the agent sees the guidance).
+  It cannot override the skip list, others' claims, or the repository's rules.
+  Fix, rebase, and review rounds ignore it.
 - `--source <path-or-url>` adapts compatible material from an existing repository,
   and needs the roadmap phase enabled plus one pinned area. It is supplementary:
   the agent prioritizes the roadmap as written, then review-quality library code,
@@ -693,7 +700,18 @@ resumes; a missing baseline does not prevent runtime work. A cost-only manual
 reconciliation does not restore that baseline. No local budget amount is passed as
 Claude's `--max-budget-usd`. After a crashed worker, first try
 `tauceti budget --recover --note "worker crash"` to recover its durable receipts
-and remove stale staged keys. Costs without a receipt still require reconciliation.
+and remove stale staged keys. Missing native totals can settle as labelled,
+correctable estimates rather than remaining unresolved indefinitely.
+
+Fleet spending also shows rates including live estimates. The existing manager
+refreshes these once per minute, independently of historical activity collection.
+It uses a small running-usage summary and, when calibrated, journal-size growth;
+sampling never parses the growing journal. Recorded spending remains available
+alongside the labelled estimate, and reservations stay excluded. Resumed sessions
+retain their attributed known prefix until deduplication supplies further usage.
+The detached usage supervisor applies the audited stopped-usage policy to eligible
+stopped invocations on ordinary minute passes; late native receipts correct those
+estimates. Reporting estimates do not change admissions or settle expenditure.
 
 Managed workers accept the same flags through `workers add`, or the
 `claude_billing = "api"`, `budget = true`, and `anthropic_api_key_file` fields
@@ -728,3 +746,12 @@ GitHub transport state (shared cache, cooldowns and pending publications) lives 
 independently of the installed worker version. `TAUCETI_GITHUB_SHARED_DIR` overrides
 this location. Comment writes are spaced across workers sharing a GitHub identity;
 secondary throttling backs off without discarding completed agent output.
+
+Plain `gh pr view --repo OWNER/REPO --json ...` scalar metadata reads also use
+the configured shared state service. Unsupported fields, formatting options,
+unavailable service data, and explicit direct-read contexts retain the normal
+CLI path. Exact-head review claims are checked as a read-only hint before
+preflight API reads; the engine still acquires and validates its existing claim.
+Request diagnostics include JSON field names and distinguish closed-PR history
+scans from open inventories. Progress batches complete labelled histories with
+independent cursors rather than caching a potentially incomplete reporting window.

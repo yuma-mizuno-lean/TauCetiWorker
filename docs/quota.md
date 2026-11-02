@@ -10,8 +10,7 @@ The pacer reads the credential files the official CLIs already maintain,
 provider's usage endpoint. It honors `$CLAUDE_CONFIG_DIR`, so switching between
 a personal and a work Claude account is paced correctly.
 
-Reading quota never spends anything, with the one exception described under
-"window bootstrap" below. `tauceti status`, the dashboard, and an auto selection
+Reading quota never sends a model request. `tauceti status`, the dashboard, and an auto selection
 that lands on Codex make no model request at all.
 
 ## Sharing Claude usage and backing off
@@ -90,6 +89,37 @@ effort: a busy lock or unavailable disk never prevents a request or launch.
 These are TauCeti's records only; they do not count other clients' requests or
 integrate with external usage scripts or services.
 
+## Local checks during quota waits
+
+Subscription loops check local credential and TauCeti usage records every 25
+seconds during a quota wait. They can notice a changed file-backed credential or
+a new shared Claude observation without waiting out an old, hour-long sleep.
+An early network attempt can be staggered by up to five seconds; cached recovery
+has no additional delay. These local checks make no HTTP requests, run no
+subprocesses, acquire no fetch locks, and do not renew or mirror credentials.
+They use existing TauCeti-owned records, including the read-only-mount fallback;
+they do not coordinate with personal usage tools.
+
+An early wake returns through normal provider selection and launch checks.
+Each provider retains its own scheduled refresh deadline: a Claude change does
+not refresh an unchanged Codex provider, even when Codex's cache has expired.
+Repeated local updates cannot postpone the original normal recheck. A newly
+applicable earlier cooldown expiry is also checked without needing another file
+change. Actual HTTP retries still honor the current identity's persisted
+cooldowns. Extra early attempts are bounded within the wait; ordinary due
+refreshes and authorized launches remain unaffected.
+
+Observation errors retain the normal scheduled retry. Isolated workers observe
+their canonical credential source and use the existing mirror synchronization
+when selection resumes. Keychain-only changes on macOS are discovered at the
+normal credential lookup, avoiding additional Keychain prompts or subprocess
+polling. Custom `--quota-cmd` commands retain their existing schedule.
+
+Runtime status keeps `next_action_at` as the normal quota recheck, with the local
+check cadence in `quota_local_check_seconds` and that recheck deadline in
+`quota_refresh_at`. Local checks do not write status or log a heartbeat on every
+tick. GitHub quota waits and no-progress backoff retain their separate schedules.
+
 ## Keeping the Claude token alive: `--auto-refresh`
 
 By default the worker never rotates a refresh token. When the Claude access token
@@ -158,31 +188,31 @@ session reset timestamp invalid
 rather than a generic "usage unknown". An unreadable constraint is not the same
 as no constraint.
 
-## The window bootstrap
+## Idle quota windows
 
-There is one gap where the endpoint reports a window with no usage and no reset
-clock: right after that window rolls. Only a Claude request can open the new
-window, so `tauceti` makes one small `claude -p` turn to do it, drops the cached
-usage, and re-reads. The fresh telemetry, not the request, then decides whether a
-round runs.
+A recognized idle window, such as `five_hour: null`, permits ordinary useful work
+when the other limits permit it. No dummy initialization turn, reservation ledger,
+or wait for active usage telemetry is needed. Status says `no active window
+reported`; it does not invent usage or a reset clock. Missing and malformed
+constraints still block. An idle weekly record has no measured weekly pace.
 
-The bootstrap runs only under these conditions:
+The existing startup-spend policy remains: a deliberately zero-spend opening
+interval, such as `--pace 0:0,90:0,100:95`, blocks idle first use. The default curve
+permits it. Active sibling windows retain normal pacing and explicit overrides.
 
-- It happens at the launch stage of a round that has already found work, so a
-  poll that finds nothing to run costs nothing.
-- Every other window must be active with real headroom. A window that is at
-  budget, over pace, exhausted, missing, or unreadable forbids the bootstrap.
-- It respects your pace curve. Under a curve whose budget stays at 0 for the
-  first stretch of a window, say `--pace 0:0,90:0,100:95`, a fresh window may not
-  be opened at all, and the status says so (`pace budget stays 0% through 90% of
-  the window`) rather than quietly opening one to manufacture a clock.
-- It is claimed under a lock in a shared ledger beside your credentials *before*
-  the request goes out, so every worker on that account, whatever its worker id,
-  checkout, or isolated `$HOME`, makes at most one request per window period,
-  even if one of them crashes mid-flight.
+Valid active/idle observations share the existing cache and twenty-minute refresh
+cadence, with the one-hour TTL and earliest original active reset as expiry bounds.
+An old active observation expires at its reset even if a newer read would call
+that clock idle. Cached observations retain their original pacing verdict; time
+alone cannot turn an old over-pace reading into permission. A cached idle sample
+may permit several workers to run before the next normal refresh, as cached active
+headroom can lag actual spend. There is no one-request allowance or account permit.
 
-If the window still is not reporting afterwards, the status reads
-`session bootstrap attempted; awaiting fresh usage` and the worker stays parked.
+Actual model-limit refusals use the existing bounded retry (up to fifteen minutes).
+A usage HTTP 200, idle or active, cannot clear that refusal; its retry expires
+automatically without requiring positive telemetry. Credential rejection and
+recovery remain separate. Old bootstrap records are ignored and need no cleanup.
+Observation commands and rounds with no eligible work make no model requests.
 
 ## Why "strictly under"
 

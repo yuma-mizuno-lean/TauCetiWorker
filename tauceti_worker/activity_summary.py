@@ -147,6 +147,9 @@ def display(value, default_kinds=()):
         ]
         rounds.append(("  " + kind, counts))
     rounds.append(("    failed/timed out", [sum(r["failed"] for r in s["rounds"][w].values()) for w in report_windows]))
+    unconfirmed = [sum(r.get("unknown", 0) for r in s["rounds"][w].values()) for w in report_windows]
+    if any(unconfirmed):
+        rounds.append(("    outcome unconfirmed", unconfirmed))
     prs = []
     for key, label in (
         ("authored", "PRs authored"),
@@ -176,12 +179,12 @@ def display(value, default_kinds=()):
                 )
             )
     costs = s.get("costs", {})
-    spending_title = (
-        "Spending (recorded usage)" if costs.get("accounting_version", 1) >= 2 else "Spending (completed sessions)"
-    )
+    spending_title = "Spending" if costs.get("accounting_version", 1) >= 2 else "Spending (completed sessions)"
     spending_rows = []
     if costs.get("spending"):
-        spending = costs["spending"]
+        spending = {
+            w: costs.get("spending_including_live", {}).get(w, costs["spending"].get(w, {})) for w in report_windows
+        }
         hours = [spending.get(w, {}).get("worker_seconds") for w in report_windows]
         spending_rows = [
             (
@@ -221,7 +224,10 @@ def display(value, default_kinds=()):
             ),
         ):
             cost_rows.append((label, [amount(windows[w].get(key)) for w in cost_windows]))
-        if costs.get("accounting_version", 1) >= 3:
+        if costs.get("accounting_version", 1) >= 3 and any(
+            windows[w].get("unresolved_stopped_usd") is None or Decimal(windows[w]["unresolved_stopped_usd"]) != 0
+            for w in cost_windows
+        ):
             # Settled estimates are already in completed sessions; recovered
             # estimates are a subset of those. Only stopped usage adds a component.
             cost_rows.append(
@@ -267,7 +273,7 @@ def display(value, default_kinds=()):
                 )
             )
     label_width = max(
-        len("Spending (recorded usage)"),
+        len(spending_title),
         *(len(label) for label, _ in [*rounds, *prs, *ci_rows, *cost_rows, *loc_rows, *spending_rows]),
     )
     headers = tuple("All time" if w == "total" else w for w in report_windows)
@@ -294,17 +300,15 @@ def display(value, default_kinds=()):
         print(f"\nReview Git claims (24h): {local.get('git_held', 0)} held / {local['started']} starts")
     if spending_rows:
         table(spending_title, headers, spending_rows, widths)
-    if spending_rows and costs.get("quality") and costs.get("accounting_version", 1) >= 2:
-        q = costs["quality"]
-        print(
-            f"Costs: native totals where available; token/interval estimates otherwise; {q.get('incomplete', 0)} conversations have incomplete usage. Reservations excluded."
-        )
+    if live := costs.get("live_estimate"):
+        age = max(0, int(time.time() - min(live["observed_at"], live.get("session_observed_at", live["observed_at"]))))
+        if age > 180 or live.get("stale"):
+            print(f"Live estimates stale: updated {age}s ago.")
     if spending_rows and costs.get("accounting_version", 1) >= 3:
-        q = costs["accounting"]
-        print(
-            f"Accounting: {q.get('live', 0)} live; {q.get('settled_estimates', 0)} settled estimates "
-            f"({q.get('recovered_estimates', 0)} recovered); {q.get('unresolved_stopped', 0)} unresolved stopped."
-        )
+        if unresolved := costs.get("accounting", {}).get("unresolved_stopped", 0):
+            print(
+                f"Accounting: {unresolved} stopped conversation{'s' if unresolved != 1 else ''} with unresolved usage."
+            )
     if cost_rows:
         cost_headers = tuple({"7d": "7 days", "total": "All time"}.get(w, w) for w in cost_windows)
         cost_widths = [
@@ -333,8 +337,30 @@ def display(value, default_kinds=()):
         print(
             f"Mathlib builds (latest per worker): {sharing.get('shared', 0)} shared, {sharing.get('private', 0)} private, {sharing.get('preparing', 0)} preparing, {sharing.get('blocked', 0)} blocked, {sharing.get('idle', 0)} idle; {sharing.get('cache_hits', 0)} cache hits; {sharing.get('preparation_seconds', 0):.1f}s preparation"
         )
-        for reason in sharing.get("reasons", []):
-            print("  " + reason)
+        reasons_by_mode = {
+            mode: list(reasons)
+            for mode, reasons in sharing.get("reasons_by_mode", {"unknown": sharing.get("reasons", [])}).items()
+        }
+        missing_checkout = "Mathlib dependency is not available for sharing"
+        # Older preparers emitted this reason in either private or required/blocked
+        # mode. Attribute it only when the counts identify exactly one of those.
+        possible_modes = [mode for mode in ("private", "blocked") if sharing.get(mode)]
+        if len(possible_modes) == 1 and missing_checkout in reasons_by_mode.get("unknown", []):
+            reasons_by_mode["unknown"].remove(missing_checkout)
+            reasons_by_mode.setdefault(possible_modes[0], []).append(missing_checkout)
+        for mode, reasons in sorted(reasons_by_mode.items()):
+            label = "Worker message (state unavailable)" if mode == "unknown" else f"{mode.capitalize()} builds"
+            messages = set()
+            for reason in reasons:
+                if reason == "shared view released; awaiting next natural round":
+                    continue
+                if mode == "private" and reason == missing_checkout:
+                    reason = "sharing was skipped because the Mathlib checkout was absent."
+                elif mode == "blocked" and reason == missing_checkout:
+                    reason = "the Mathlib checkout was absent, but sharing is required."
+                messages.add(reason)
+            for message in sorted(messages):
+                print(f"  {label}: {message}")
     recovery = s.get("work_recovery")
     if recovery and (any(recovery.get(key) for key in RECOVERY_COUNTS) or recovery.get("preparation_metadata_entries")):
         print()
@@ -577,6 +603,29 @@ def combine(values):
         k: sum(v.get("costs", {}).get("quality", {}).get(k, 0) for v in known)
         for k in ("native", "estimated", "incomplete")
     }
+    if any(v.get("costs", {}).get("spending_including_live") for v in known):
+        s["costs"]["spending_including_live"] = {}
+        for w in report_windows:
+            rows = [v.get("costs", {}).get("spending_including_live", {}).get(w, {}) for v in known]
+            complete = (
+                compatible_costs and len(known) == len(values) and all(r.get("spent_usd") is not None for r in rows)
+            )
+            recorded = s["costs"].get("spending", {}).get(w, {})
+            total = str(sum((Decimal(r["spent_usd"]) for r in rows), Decimal(0))) if complete else None
+            s["costs"]["spending_including_live"][w] = {
+                **recorded,
+                "spent_usd": total,
+                "recorded_spent_usd": recorded.get("spent_usd"),
+                "usd_per_hour": hourly_rate(total, recorded.get("covered_seconds")),
+                "usd_per_worker_hour": hourly_rate(total, recorded.get("worker_seconds")),
+                **{
+                    key: str(sum((Decimal(r[key]) for r in rows), Decimal(0))) if complete else None
+                    for key in ("live_observed_usd", "live_unobserved_estimate_usd", "live_adjustment_usd")
+                },
+            }
+        stamps = [v.get("costs", {}).get("live_estimate", {}).get("observed_at") for v in known]
+        if all(stamp is not None for stamp in stamps):
+            s["costs"]["live_estimate"] = dict(observed_at=min(stamps), refresh_seconds=60)
     s["costs"]["accounting"] = {
         k: sum(v.get("costs", {}).get("accounting", {}).get(k, 0) for v in known)
         for k in ("live", "settled_estimates", "recovered_estimates", "unresolved_stopped")
@@ -588,6 +637,13 @@ def combine(values):
             for key in ("shared", "private", "preparing", "blocked", "idle", "cache_hits", "preparation_seconds")
         }
         s["shared_mathlib"]["reasons"] = sorted({reason for row in sharing for reason in row.get("reasons", [])})
+        reasons_by_mode = {}
+        for row in sharing:
+            for mode, reasons in row.get("reasons_by_mode", {"unknown": row.get("reasons", [])}).items():
+                reasons_by_mode.setdefault(mode, set()).update(reasons)
+        s["shared_mathlib"]["reasons_by_mode"] = {
+            mode: sorted(reasons) for mode, reasons in sorted(reasons_by_mode.items())
+        }
     recovery = [v.get("work_recovery", {}) for v in known]
     if any(recovery):
         s["work_recovery"] = {key: sum(row.get(key, 0) for row in recovery) for key in RECOVERY_COUNTS}
