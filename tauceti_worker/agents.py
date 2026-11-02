@@ -921,6 +921,13 @@ def run_agent_host(
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
     _LAST_AGENT_FAILURE = None
+    if profile.provider in OPENROUTER_MODELS and not PI_RUN:
+        from .openrouter_auth import ensure_pi_model
+
+        try:
+            ensure_pi_model(profile.model, env)
+        except RuntimeError as error:
+            raise AgentLaunchUnavailable(str(error)) from None
     with host_build_cache_context(cwd, env, logdir) as prefix:
         rc = run_agent_proc(
             [*(prefix or []), *argv],
