@@ -1,6 +1,6 @@
 You are authoring a new pull request to TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a clean checkout of `main`. Pick the next genuine step on the designated roadmap's critical path. If an explicit upstream dependency blocks it, follow that dependency under the rules below. Write the best small, complete, sorry-free PR you can — optimised to pass the project's review rubrics. Do honest mathematics. Work autonomously to completion.
 
-## Choose a target
+__EXTRA_ROADMAP_PROMPT__## Choose a target
 - **Choose a concrete target.** Start with `__ONLY__`, the roadmap you were assigned. If it is `any`, choose a roadmap directory under `__ROADMAP_DIR__/` that is not listed in `__SKIP__`. Read its `README.md` in full; it is definitive, while `Suggested.lean` is optional guidance. Identify its next unmet milestone and the next step that milestone needs; do not choose easy work no milestone needs. In the PR body, name the milestone and say in one sentence what remains after this PR.
 - **Follow prerequisites across roadmaps.** If reaching that target requires preliminary work which its README assigns to another canonical roadmap, you are encouraged to switch to that prerequisite. This is in scope even when `__ONLY__` names a particular roadmap. Read the prerequisite roadmap's README, choose the missing target it calls for, and follow further prerequisites the same way. Keep the chain tied to the original milestone rather than roaming to related work. In the PR body, cite each consumer milestone and prerequisite target; a prerequisite claim must name the declaration or milestone statement that will consume it.
 - **Never target `__SKIP__`,** including through a dependency. Choose another critical-path step or stop without a PR. `none` means no exclusions.
@@ -46,7 +46,7 @@ Once you have settled on a target, derive a short stable id for it and claim it 
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
   Classic `import Mathlib...` syntax is simplest.
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. Choose a target supported by an existing roadmap; if none is suitable, finish without opening a PR.
-- Aim for ~200–600 lines of genuine, non-vacuous content. A shorter PR that closes a milestone beats a longer peripheral one, and smaller-but-green beats bigger-but-broken. No tautologies, no `True`-placeholder fields, no vacuous definitions. Follow Mathlib naming/docstring conventions, and never silence a linter or use `set_option`.
+- Aim for ~500–1200 lines of genuine, non-vacuous content. A shorter PR that closes a milestone beats a longer peripheral one, and smaller-but-green beats bigger-but-broken. No tautologies, no `True`-placeholder fields, no vacuous definitions. Follow Mathlib naming/docstring conventions, and never silence a linter or use `set_option`.
 - Must build green AND pass the axiom audit (allowlist: `propext`, `Classical.choice`, `Quot.sound`; no `sorry`/`native_decide`/new axioms/`maxHeartbeats`).
 
 ## Review your own diff, before you verify

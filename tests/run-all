@@ -36,7 +36,10 @@ trap 'rm -rf "$TAUCETI_ACTIVITY_DIR"' EXIT
 # stdlib-only python tests, run with the uv-provided interpreter
 RUN_STDLIB=(
   activity.py
+  activity_git.py
   activity_costs.py
+  activity_incremental.py
+  activity_live.py
   api_budget.py
   budget_projection.py
   budget_recovery.py
@@ -119,6 +122,7 @@ RUN_STDLIB=(
   quota_auto_refresh.py
   quota_cache_fp.py
   quota_loop_refresh.py
+  quota_wakeups.py
   quota_shared_usage.py
   rebase_handoff.py
   scoped_repair_route.py
@@ -134,6 +138,7 @@ RUN_STDLIB=(
   review_diagnostics.py
   review_provider_down.py
   review_outcomes.py
+  synchronous_state_repair.py
   review_scheduling.py
   review_state_freshness.py
   review_throttles.py
@@ -150,12 +155,14 @@ RUN_STDLIB=(
   shared_build_caches.py
   shared_repositories.py
   source_argument.py
+  extra_roadmap_prompt.py
   spread_candidates.py
   ssl_cert_file.py
   status_labels.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
+  worker_scopes.py
   recovery_maintenance.py
   work_recovery.py
   repair_recovery.py

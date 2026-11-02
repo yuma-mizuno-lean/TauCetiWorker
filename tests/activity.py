@@ -6,9 +6,12 @@ import io
 import json
 import os
 import re
+import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -45,6 +48,152 @@ class ActivityTests(unittest.TestCase):
         self.addCleanup(recovery_home.stop)
         self.now = time.time()
 
+    def test_collector_keeps_minute_cadence_without_overlapping_or_replaying_missed_ticks(self):
+        from tauceti_worker import processes, worker_scopes
+
+        clock = [0.0]
+        starts, waits = [], []
+        durations = iter([40, 82, 3, 1, 2])
+        exits = iter([0, 0, 1, -signal.SIGTERM, -signal.SIGKILL])
+
+        class Stop:
+            def is_set(self):
+                return len(waits) == 5
+
+            def wait(self, delay):
+                waits.append(delay)
+                clock[0] += delay
+
+        def refresh(argv, **kwargs):
+            self.assertEqual(
+                argv[-5:], ["activity", "refresh", "--json", "--config", str(Path(self.tmp.name) / "workers.toml")]
+            )
+            self.assertEqual(kwargs["env"]["TAUCETI_ACTIVITY_DIR"], self.tmp.name)
+            self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+            self.assertTrue(kwargs["check"])
+            starts.append(clock[0])
+            clock[0] += next(durations)
+            returncode = next(exits)
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, argv)
+
+        # Run the actual collector body synchronously with a controlled clock.
+        # Thread creation is the only scheduling boundary replaced here.
+        def start_thread(**kwargs):
+            return SimpleNamespace(start=kwargs["target"])
+
+        with (
+            patch.object(a.threading, "Event", return_value=Stop()),
+            patch.object(a.threading, "Thread", side_effect=start_thread),
+            patch.object(a.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(processes, "run", side_effect=refresh),
+            patch.object(a, "atomic_json", wraps=a.atomic_json) as publish,
+            patch.object(worker_scopes, "collect_oom_events", return_value=False),
+        ):
+            a.start_collector(Path(self.tmp.name) / "workers.toml")
+        self.assertEqual(starts, [0, 60, 142, 202, 262])
+        self.assertEqual(waits, [20, 0, 57, 59, 58])
+        self.assertEqual(publish.call_count, 2, "failed/OOM children report errors; intentional SIGTERM does not")
+        self.assertEqual(a.read_json(a.root() / "preparation-error.json")["error"], "CalledProcessError")
+
+    def test_live_sampling_continues_while_historical_refresh_is_blocked(self):
+        from tauceti_worker import activity_live, processes, worker_scopes
+
+        entered, release, sampled = threading.Event(), threading.Event(), threading.Event()
+
+        def refresh(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+
+        with (
+            patch.object(processes, "run", side_effect=refresh),
+            patch.object(worker_scopes, "collect_oom_events", return_value=False),
+            patch.object(activity_live, "sample", side_effect=sampled.set),
+        ):
+            stop = a.start_collector(None)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(sampled.wait(2), "live sampling must not wait for the historical subprocess")
+            finally:
+                stop.set()
+                release.set()
+                for thread in threading.enumerate():
+                    if thread.name in {"activity-preparation", "live-spending"}:
+                        thread.join(2)
+
+    def test_collector_owner_exit_cleans_refresh_descendants_and_releases_locks(self):
+        import fcntl
+
+        from tauceti_worker.paths import self_env
+
+        marker = a.root() / "child-started"
+        locks = [a.root() / "prepare.lock", a.root() / "helper.lock"]
+        helper = (
+            "import fcntl,sys,time;from pathlib import Path;"
+            "lock=open(sys.argv[1],'a');fcntl.flock(lock,fcntl.LOCK_EX);"
+            "Path(sys.argv[2]).touch();time.sleep(60)"
+        )
+        refresh = (
+            "import fcntl,subprocess,sys;"
+            "lock=open(sys.argv[1],'a');fcntl.flock(lock,fcntl.LOCK_EX);"
+            f"subprocess.run([sys.executable,'-c',{helper!r},sys.argv[2],sys.argv[3]],check=True)"
+        )
+        argv = [sys.executable, "-c", refresh, *map(str, locks), str(marker)]
+        wait_for_child = f"while not Path({str(marker)!r}).exists(): time.sleep(.01)"
+        owner_code = (
+            "import os,time;from pathlib import Path;from tauceti_worker import activity,paths,worker_scopes;"
+            f"paths.self_argv=lambda *args:{argv!r};"
+            "worker_scopes.collect_oom_events=lambda *args:False;activity.start_collector(None);"
+            f"exec({wait_for_child!r});os._exit(0)"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-c", owner_code],
+            env=self_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        ) as owner:
+            try:
+                owner.wait(timeout=15)
+            except BaseException:
+                owner.kill()
+                raise
+            self.assertEqual(owner.returncode, 0)
+        self.assertTrue(marker.exists(), "refresh helper never acquired its lock")
+        for path in locks:
+            with path.open("a") as lock:
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self.fail(f"orphaned refresh process still holds {path.name}")
+                        time.sleep(0.01)
+
+    def test_refresh_child_inherits_activity_root_and_respects_existing_preparation_lock(self):
+        import fcntl
+
+        from tauceti_worker.paths import self_argv, self_env
+
+        published = dict(version=1, prepared_at=self.now, all={"marker": "previous publication"}, errors=[])
+        a.atomic_json(a.root() / "summary.json", published)
+        with (a.root() / "prepare.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            child = subprocess.run(
+                self_argv("activity", "refresh", "--json", "--config", str(a.root() / "workers.toml")),
+                env=self_env(),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+        self.assertEqual(json.loads(child.stdout)["summary"], published["all"])
+        self.assertEqual(a.read_json(a.root() / "summary.json"), published)
+        self.assertFalse((a.root() / "activity.sqlite").exists())
+
     def finish(self, age, kind="review", outcome="completed", rid=None):
         rid = rid or str(age)
         with patch.object(a.time, "time", return_value=self.now - age):
@@ -61,6 +210,43 @@ class ActivityTests(unittest.TestCase):
             cutoff = float(db.execute("SELECT value FROM meta WHERE key='history_cutoff'").fetchone()[0])
             self.assertEqual(cutoff, epoch)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM rounds WHERE id='first'").fetchone()[0], 1)
+
+    def test_receipts_stay_durable_and_missing_derived_views_rebuild_from_ingested_facts(self):
+        from tauceti_worker import runtime_status
+
+        with patch.object(runtime_status.os, "fsync", wraps=os.fsync) as sync:
+            self.assertTrue(
+                a.emit("round_finished", round_id="durable-round", round_type="review", outcome="completed")
+            )
+            self.assertEqual(sync.call_count, 1)
+        with patch("tauceti_worker.activity_live.atomic_json", wraps=a.atomic_json) as publish:
+            a.prepare(now=self.now + 1)
+        views = [call for call in publish.call_args_list if call.args[0].name != "preparation-error.json"]
+        self.assertTrue(views)
+        self.assertTrue(all(call.kwargs.get("durable") is False for call in views), views)
+        self.assertFalse(list((a.root() / "pending").glob("*.json")))
+        for path in (a.root() / "summary.json", a.scope_path("workers", "worker"), a.scope_path("groups", "machine")):
+            path.write_text("")  # Simulate a disposable cache lost during a power failure.
+        self.assertFalse(a.cached()["available"])
+        a.prepare(now=self.now + 2)
+        for selection in ({}, {"worker": "worker"}, {"group": "machine"}):
+            restored = a.cached(**selection)
+            self.assertTrue(restored["available"], restored)
+            self.assertEqual(restored["summary"]["rounds"]["total"]["review"]["finished"], 1)
+
+    def test_nondurable_view_still_replaces_atomically_and_cleans_failed_temp_file(self):
+        from tauceti_worker import runtime_status
+
+        path = a.root() / "view.json"
+        a.atomic_json(path, {"old": True})
+        with (
+            patch.object(runtime_status.os, "fsync", side_effect=AssertionError("derived view forced to disk")),
+            patch.object(runtime_status.os, "replace", side_effect=OSError("rename failed")),
+            self.assertRaises(OSError),
+        ):
+            a.atomic_json(path, {"new": True}, durable=False)
+        self.assertEqual(a.read_json(path), {"old": True})
+        self.assertFalse(list(a.root().glob(".view.json.*")))
 
     def test_upgrade_preserves_usage_history_and_ignores_old_containment_projection(self):
         with contextlib.closing(a._connect()) as db, db:
@@ -109,6 +295,53 @@ class ActivityTests(unittest.TestCase):
         pr_start = next(i for i, line in enumerate(lines) if line.startswith("PRs authored"))
         self.assertEqual(lines[pr_start - 1], "")
 
+    def test_mathlib_worker_message_states_survive_fleet_aggregation(self):
+        a.prepare(now=self.now)
+        one, two, older = a.cached(), a.cached(), a.cached()
+        private_reason = "Mathlib dependency is not available for sharing"
+        clear_reason = "sharing was skipped because the Mathlib checkout was absent."
+        idle_reason = "shared view released; awaiting next natural round"
+        one["summary"]["shared_mathlib"] = dict(
+            private=2,
+            idle=14,
+            reasons=[private_reason, idle_reason],
+            reasons_by_mode={"private": [private_reason], "idle": [idle_reason]},
+        )
+        two["summary"]["shared_mathlib"] = dict(
+            private=1, reasons=[clear_reason], reasons_by_mode={"private": [clear_reason]}
+        )
+        older["summary"]["shared_mathlib"] = dict(private=1, reasons=["legacy reason"])
+        for value in (one, a.activity_summary.combine([one, two, older])):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertEqual(output.getvalue().count(f"  Private builds: {clear_reason}\n"), 1)
+            self.assertNotIn(idle_reason, output.getvalue())
+            self.assertNotIn(f"  {private_reason}\n", output.getvalue())
+        self.assertIn("  Worker message (state unavailable): legacy reason\n", output.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn("  Worker message (state unavailable): legacy reason\n", output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(idle=1, reasons=[idle_reason])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(a.activity_summary.combine([older]))
+        self.assertNotIn(idle_reason, output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(private=1, reasons=[private_reason, idle_reason])
+        for value in (older, a.activity_summary.combine([older])):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertIn(f"  Private builds: {clear_reason}\n", output.getvalue())
+            self.assertNotIn(idle_reason, output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(blocked=1, reasons=[private_reason])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn(
+            "  Blocked builds: the Mathlib checkout was absent, but sharing is required.\n", output.getvalue()
+        )
+        older["summary"]["shared_mathlib"]["private"] = 1
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn(f"  Worker message (state unavailable): {private_reason}\n", output.getvalue())
+
     def test_housekeeping_failure_does_not_abort_activity_refresh(self):
         from tauceti_worker import work_recovery
 
@@ -116,6 +349,19 @@ class ActivityTests(unittest.TestCase):
             value = a.prepare(now=self.now)
         self.assertTrue(a.cached()["available"])
         self.assertTrue(any("Recovery housekeeping deferred" in error for error in value["errors"]))
+
+    def test_installed_collector_keeps_destructive_cleanup_out_of_reporting(self):
+        from tauceti_worker import retention, work_recovery
+
+        a.atomic_json(a.root() / "cleanup-service.json", dict(installed=True))
+        with (
+            patch.object(work_recovery, "housekeep", return_value=dict(cleanup_pending=True)) as inventory,
+            patch.object(retention, "request_cleanup") as request,
+        ):
+            a.prepare(now=self.now)
+        inventory.assert_called_once_with(cleanup=False)
+        request.assert_called_once()
+        self.assertTrue(a.cached()["available"])
 
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)
@@ -279,6 +525,33 @@ class ActivityTests(unittest.TestCase):
             a.prepare(now=self.now + 362)
             self.assertEqual(observation.call_count, 1)
         self.assertEqual(a.cached()["summary"]["open_prs"], 1)
+
+    def test_missing_loc_uses_exact_git_comparison_in_normal_refresh(self):
+        a.emit("pr_created", repository="org/repo", pr=7)
+        head, base = "a" * 40, "b" * 40
+        response = dict(
+            prs=[
+                dict(number=7, state="OPEN", observed_at=self.now * 1000, head_sha=head, base_sha=base, lean_loc=None)
+            ],
+            missing=[],
+        )
+        env = {
+            "TAUCETI_GITHUB_STATE_URL": "https://state.example",
+            "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read-by-mock",
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch.object(a, "observe", return_value=response),
+            patch.object(
+                a.activity_git, "measure", return_value={7: dict(added=17, deleted=3, head_sha=head)}
+            ) as measure,
+        ):
+            a.prepare(now=self.now + 1)
+            a.prepare(now=self.now + 61)
+        self.assertEqual(measure.call_count, 1)
+        with contextlib.closing(a._connect()) as db:
+            row = db.execute("SELECT head,added,deleted FROM pr_loc WHERE repo='org/repo' AND number=7").fetchone()
+            self.assertEqual(tuple(row), (head, 17, 3))
 
     def test_read_and_display_do_not_open_database_or_network(self):
         self.finish(10)

@@ -35,6 +35,7 @@ from .constants import (
     OPENROUTER_MODELS,
     PI_RUN,
     REVIEW,
+    REVIEW_HEAD_CHANGED_EXIT,
     ROADMAP,
     TAUCETI,
 )
@@ -1260,7 +1261,7 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
         rc = run_process(argv, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
-    if rc != 0 and not (rc == EX_CLAIM_COLLISION and label.startswith("review #")):
+    if rc != 0 and not (rc in (EX_CLAIM_COLLISION, REVIEW_HEAD_CHANGED_EXIT) and label.startswith("review #")):
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         tail: list[str] = []
         try:
@@ -1382,15 +1383,18 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         env.pop("TAUCETI_PR_CACHE_MISS", None)
         env.setdefault("LAKE_ARTIFACT_CACHE", "1")
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
-        from . import shared_mathlib
+        from . import expanded_cache, shared_mathlib
 
+        report = {}
+        mathlib_started = expanded_cache.clock()
         try:
             with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
+                expanded_cache.record_phase(report, "mathlib_view", mathlib_started)
                 if prefix:
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
                 try:
                     try:
-                        prepare_host_build_caches(cwd, env, logdir)
+                        prepare_host_build_caches(cwd, env, logdir, report=report)
                     except Exception as error:
                         if prefix:
                             shared_mathlib.preparation_status(env, error=error)
@@ -1422,7 +1426,7 @@ def _host_cache_max_revs(env: dict) -> str:
     return str(min(int(value) or 20, 20)) if _host_public_cache_policy() else value
 
 
-def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
+def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:
     """Fetch and hydrate shared artifacts before either normal work or recovery verification."""
     from . import expanded_cache
 
@@ -1430,6 +1434,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
     with expanded_cache.preparation(
         cwd,
         env,
+        report=report,
         refetch=lambda warm: _cache_fetch(
             [
                 *prefix,
@@ -1449,7 +1454,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
         ),
     ) as warm_env:
         try:
-            warm_host_build_caches(cwd, warm_env, logdir)
+            warm_host_build_caches(cwd, warm_env, logdir, report=report)
         except OptionalPublicCacheUnavailable:
             warm_env["LAKE_NO_CACHE"] = "true"
             env["LAKE_NO_CACHE"] = "true"
@@ -1505,7 +1510,7 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
             reap_round_group(proc.pid)
 
 
-def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
+def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:
     """Fetch both caches on the selected branch; warm main too for subsequent rebases.
 
     Genuine workspace errors must reach repair agents. Transport, publication and partial-download
@@ -1539,9 +1544,12 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
                 output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
                 output.flush()
                 try:
-                    rc = _cache_fetch(
-                        [*prefix, *command], cwd, env, output, min(remaining, 120) if optional_root else remaining
-                    )
+                    from .expanded_cache import measured
+
+                    with measured(report, label.lower().replace(" ", "_") + "_fetch"):
+                        rc = _cache_fetch(
+                            [*prefix, *command], cwd, env, output, min(remaining, 120) if optional_root else remaining
+                        )
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1

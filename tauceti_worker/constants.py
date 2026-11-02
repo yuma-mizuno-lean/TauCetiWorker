@@ -51,7 +51,7 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "2d7bd8b7636560a50acf1b419761186f247009b9")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "f69ce81bea53e6bb0a11445eee8cc9f713cb7ce7")
 # A repaired tool gets a fresh error budget. Failures of an older pinned release must not
 # permanently suppress progress after an upgrade; the attempt gap still limits retries.
 # Keep the usual immutable SHA readable, and hash other refs so a branch name containing
@@ -154,6 +154,8 @@ EX_ADMISSION_WAIT = 76  # Fleet capacity/API funding/queue/throughput wait, outs
 EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
 EX_RECOVERY_IDLE = 80  # Mechanical recovery found no available work; select normal work immediately
 EX_CLAIM_COLLISION = 81  # Peer owns the candidate; skip or briefly reselect, never failure backoff
+REVIEW_HEAD_CHANGED_EXIT = 82  # Review command refused a superseded selection before inference
+REVIEW_PREPARATION_WAIT_EXIT = 83  # Transport/host preparation failed before any paid review
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 
@@ -255,7 +257,7 @@ AUTHORING_DEFAULTS = {
     # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
     # that this repository default is unavailable to the current subscription.
     "codex": ("gpt-6.1-sol", "high"),
-    # Pin Claude authoring, reviews and quota bootstrap to an exact model, not the moving opus alias.
+    # Pin Claude authoring and reviews to an exact model, not the moving opus alias.
     # The review engine must price a new model first, so update TauCetiReview before this default.
     "claude": ("claude-opus-5-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled
