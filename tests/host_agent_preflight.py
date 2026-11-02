@@ -42,7 +42,7 @@ check("review auto -> None (nothing to gate)", wu._host_agent_binary("review", "
 for model in ("codex", "claude", "kiro", "deepseek", "minimax"):
     launcher_bin = tc.host_agent_argv("", model)[0][0]
     check(f"fix {model} -> host_agent_argv argv[0]", wu._host_agent_binary("fix", model), launcher_bin)
-check("fix deepseek -> PI_RUN", wu._host_agent_binary("fix", "deepseek"), tc.PI_RUN)
+check("fix deepseek -> pi", wu._host_agent_binary("fix", "deepseek"), "pi")
 check("default fix codex preflights underlying CLI", wu._host_agent_binary("fix", "codex"), "codex")
 
 # A custom claude wrapper: the preflight must target the wrapper, not bare `claude`, or it would

@@ -394,12 +394,12 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_REVIEW_KIRO_MODEL` | `gpt-5.6-sol` | Exact Kiro review-model pin, independent of authoring. |
 | `TAUCETI_CODEX_MODEL` | _(deprecated)_ | Legacy fallback for the Codex authoring model only. Prefer `TAUCETI_AUTHORING_CODEX_MODEL`. |
 | `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
-| `OPENROUTER_API_KEY` | — | Required for `--agent deepseek\|minimax`; staged read-only into the bubble. |
+| `OPENROUTER_API_KEY` | Pi OpenRouter login | Explicit key for `--agent deepseek\|minimax`; otherwise resolved from Pi before worker isolation. Staged read-only into the bubble. |
 | `OPENROUTER_MANAGEMENT_KEY` | — | Optional management key for account-wide `tauceti usage` credit totals; never passed to an agent. |
 | `KIRO_API_KEY` | browser login | Optional headless Kiro credential. TauCeti isolates the browser store when set so the key wins deterministically. |
 | `TAUCETI_KIRO_HOME` / `TAUCETI_KIRO_DATA_DIR` | per-worker when isolated | Internal redirects for Kiro settings and its platform-native browser-auth SQLite store. |
 | `TAUCETI_KIRO_BURN_RATE` / `TAUCETI_OPENROUTER_BURN_RATE` | _(unset)_ | Observability-only default burn rates for `tauceti usage`; never used by the loop pacer. |
-| `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on the host. |
+| `PI_RUN` | unset | Optional legacy OpenRouter runner; by default the worker invokes `pi` directly on the host. |
 | `TAUCETI_BUBBLE` | `bubble` (else `uvx` for dry-run probes only) | Override the Bubble executable. |
 | `TAUCETI_BUBBLE_HOME` | per-worker cache dir | Override the private bubble home. |
 | `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |

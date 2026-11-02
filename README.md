@@ -66,8 +66,9 @@ kiro-cli login         # for explicit --agent kiro
 ```
 
 Code-writing phases on the host also need an `elan`/`lake` toolchain. The
-OpenRouter agents need an exported `OPENROUTER_API_KEY` instead, plus the `pi`
-runner for host rounds; Bubble includes `pi`. The `--bubble` sandbox has
+OpenRouter agents need `pi` and either an exported `OPENROUTER_API_KEY` or an
+OpenRouter login through `pi` (run `/login openrouter`). The worker obtains
+Pi credentials before isolating its HOME; Bubble includes `pi`. The `--bubble` sandbox has
 additional requirements; see [the sandbox notes](docs/sandbox.md).
 
 Install it as a tool, no clone needed:
