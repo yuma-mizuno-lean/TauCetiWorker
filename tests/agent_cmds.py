@@ -72,7 +72,9 @@ assert "ANTHROPIC_API_KEY" not in env, "claude env must drop ANTHROPIC_API_KEY (
 print("[OK ] claude env drops ANTHROPIC_API_KEY")
 
 a, env = tc.host_agent_argv(P, "deepseek")
-check("deepseek", a, ["pi", "--provider", "openrouter", "--model", tc.OPENROUTER_MODELS["deepseek"], "--print", "--", P])
+check(
+    "deepseek", a, ["pi", "--provider", "openrouter", "--model", tc.OPENROUTER_MODELS["deepseek"], "--print", "--", P]
+)
 
 a, env = tc.host_agent_argv(P, "kiro")
 check(
