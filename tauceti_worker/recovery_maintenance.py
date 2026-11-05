@@ -46,6 +46,8 @@ COUNTS = (
     "corrupt",
     "errors",
 ) + tuple("recovery_" + state for state in CONSUMER_STATES)
+RECOVERY_RECORD_TTL = 24 * 3600
+
 _SWEEPS = {}
 _CHECKS = ContextVar("cleanup_checks", default=None)
 
@@ -788,6 +790,70 @@ def _cleanup(state, tree, root, work, observation=None):
             _write_job(path, job)
 
 
+def abandon_incomplete(state, record):
+    """Move an old, unused partial save to ordinary bounded disposal. Never salvage it."""
+    from . import work_recovery as wr
+
+    if record.parent != state / "recovery" or not record.name.startswith(".tmp-") or record.is_symlink():
+        return None
+    info = record.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        return None
+    latest = info.st_mtime
+    stamps = {}
+    for name in (
+        "commits.bundle",
+        "commits.bundle.lock",
+        "staged.patch",
+        "unstaged.patch",
+        "untracked.tar",
+        "manifest.json",
+    ):
+        wr._charge(entries=1)
+        try:
+            payload = (record / name).lstat()
+            latest = max(latest, payload.st_mtime)
+            stamps[name] = (payload.st_dev, payload.st_ino, payload.st_size, payload.st_mtime_ns, payload.st_ctime_ns)
+        except FileNotFoundError:
+            stamps[name] = None
+    if time.time() - latest < wr.INCOMPLETE_SAVE_TTL:
+        return None
+    with (state / "recovery-save.lock").open("a+b") as lease:
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        # Fresh process/mount/reference checks also protect pre-lease saves and stragglers.
+        with completed_check():
+            if _referenced(state, record) or wr.live_users(record):
+                return None
+            mounts = retention.mount_points()
+            if mounts is None:
+                return None
+            target = canonical_candidate(record)
+            if any(mount == target or mount.is_relative_to(target) for mount in mounts):
+                return None
+        current = record.lstat()
+        if (current.st_dev, current.st_ino, current.st_mtime_ns) != (info.st_dev, info.st_ino, info.st_mtime_ns):
+            return None
+        for name, before in stamps.items():
+            wr._charge(entries=1)
+            try:
+                payload = (record / name).lstat()
+                after = (payload.st_dev, payload.st_ino, payload.st_size, payload.st_mtime_ns, payload.st_ctime_ns)
+            except FileNotFoundError:
+                after = None
+            if after != before:
+                return None  # A legacy writer changed bytes without changing the directory mtime.
+        discarded = state / "recovery-cleanup" / "discarded"
+        discarded.mkdir(parents=True, exist_ok=True)
+        target = discarded / ("partial-" + record.name[5:] + "-" + uuid.uuid4().hex)
+        record.rename(target)
+        wr._fsync_dir(record.parent)
+        wr._fsync_dir(discarded)
+        return target
+
+
 class Sweep:
     def __init__(self, base, *, cleanup=True):
         self.base = base
@@ -798,22 +864,31 @@ class Sweep:
         self.pending = None
         self.current_registration = {}
         self.registered_roots = {}
+        self.retirement_cursor = base / (
+            ".recovery-retirement-cursor.json" if cleanup else ".recovery-inventory-retirement-cursor.json"
+        )
         self.retirements = self.retirement_scan()
 
     def retirement_scan(self):
-        # Independent of bulk deletion: a large old checkout cannot delay
-        # retirement of a newer finished task on another worker.
-        with os.scandir(self.base) as workers:
-            for entry in workers:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
+        # Native collectors restart between passes. Persist progress independently of
+        # bulk deletion so fresh/live records at the front cannot starve older ones.
+        cursor = _metadata(self.retirement_cursor).get("after", "")
+        for after in (True, False):
+            with os.scandir(self.base) as workers:
+                ordered = sorted((e for e in workers if e.is_dir(follow_symlinks=False)), key=lambda e: e.name)
+            for entry in ordered:
                 state = Path(entry.path)
                 root = state / "recovery"
                 if root.is_dir():
                     with os.scandir(root) as records:
-                        for record in records:
-                            if record.is_dir(follow_symlinks=False) and not record.name.startswith("."):
-                                yield state, Path(record.path)
+                        ordered_records = sorted(
+                            (e for e in records if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")),
+                            key=lambda e: e.name,
+                        )
+                    for record in ordered_records:
+                        key = f"{state.name}/{record.name}"
+                        if (key > cursor) == after:
+                            yield state, Path(record.path)
 
     def scan(self):
         if not self.base.is_dir():
@@ -1055,9 +1130,14 @@ class Sweep:
             if not path.is_dir() or path.is_symlink():
                 return
             if path.name.startswith(".tmp-"):
-                row["incomplete"] += 1
-                return
+                if self.cleanup:
+                    self.cleanup_pending |= abandon_incomplete(state, path) is not None
+                return  # Temporary writes are not recovery records or operator tasks.
             consumer = read_json(path / "recovery.json")
+            if abandonment_reason(path, consumer):
+                self.cleanup_pending = True
+                if self.cleanup and discard_record(state, path):
+                    return
             from .repair_recovery import ACTIVE_HANDOFF, RETRYABLE, write
 
             state_name = consumer.get("state")
@@ -1235,12 +1315,13 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
                 except StopIteration:
                     sweep.retirements = sweep.retirement_scan()
                     break
+                atomic_json(sweep.retirement_cursor, dict(after=f"{state.name}/{record.name}"))
                 consumer = _metadata(record / "recovery.json")
                 from .repair_recovery import ACTIVE_HANDOFF, RETRYABLE
 
                 code = (consumer.get("reason") or {}).get("code")
                 handed_off = (consumer.get("handoff") or {}).get("state") == "offered" and code in ACTIVE_HANDOFF
-                if (
+                if abandonment_reason(record, consumer) or (
                     consumer.get("state") in {"published", "obsolete", "blocked"}
                     and not handed_off
                     and code not in RETRYABLE
@@ -1295,6 +1376,24 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
     return report
 
 
+def abandonment_reason(record, consumer):
+    """A fixed source lifetime, independent of retries, journals, funding and worker admission."""
+    if (consumer.get("reason") or {}).get("code") == "content-allowance":
+        return "content-allowance-exhausted"
+    manifest = _metadata(record / "manifest.json")
+    try:
+        # Manifest bytes are immutable; journal/checkpoint activity cannot renew the clock.
+        written = (record / "manifest.json").stat().st_mtime
+    except FileNotFoundError:
+        written = record.stat().st_mtime
+    created = manifest.get("created_at")
+    if isinstance(created, (int, float)) and not isinstance(created, bool) and 0 < created < written:
+        written = created
+    if time.time() - written >= RECOVERY_RECORD_TTL:
+        return "recovery-lifetime-exhausted"
+    return None
+
+
 def discard_record(state, record):
     """Retire a finished/unrecoverable record; deletion reuses bounded housekeeping."""
     from . import work_recovery as wr
@@ -1310,14 +1409,29 @@ def discard_record(state, record):
 
         consumer = _metadata(record / "recovery.json")
         code = (consumer.get("reason") or {}).get("code")
-        if consumer.get("state") not in {"published", "obsolete", "blocked"} or code in RETRYABLE:
-            return False
-        if (consumer.get("handoff") or {}).get("state") == "offered" and code in ACTIVE_HANDOFF:
-            return False
+        abandon = abandonment_reason(record, consumer)
+        if not abandon:
+            if consumer.get("state") not in {"published", "obsolete", "blocked"} or code in RETRYABLE:
+                return False
+            if (consumer.get("handoff") or {}).get("state") == "offered" and code in ACTIVE_HANDOFF:
+                return False
         # An already-running verifier may still use this tree after the consumer
         # finishes. It can finish; the next activity tick retries disposal.
         with completed_check():
-            if (record / "checkout").is_dir() and wr.live_users(record / "checkout"):
+            if abandon:
+                if wr.live_users(record):
+                    return False
+                handoff = consumer.get("handoff") or {}
+                checkout = handoff.get("checkout")
+                if handoff.get("state") == "offered" and checkout:
+                    owner = _metadata(state / "checkout-owners" / "TauCeti.json")
+                    source_round = handoff.get("source_round")
+                    if source_round and owner.get("round_id") == source_round:
+                        if not wr.owner_stopped(owner.get("process")) or wr.live_users(Path(checkout)):
+                            return False
+                    elif not owner.get("round_id") and wr.live_users(Path(checkout)):
+                        return False  # Unknown attribution cannot prove the receiving round is finished.
+            elif (record / "checkout").is_dir() and wr.live_users(record / "checkout"):
                 return False
             # Same-device bind mounts need protection too; the bounded remover cannot
             # distinguish them from ordinary directories using inode/device alone.

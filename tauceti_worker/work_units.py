@@ -443,6 +443,9 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
                     scope = random_roadmap_area(w, focus=focus, fallback=False)
                     focused_round = scope not in (None, "any")
             global_pick = scope in (None, "", "auto", "any")
+            # Fleet status counts focused running rounds from this field; the
+            # loop clears it between rounds and a fallback round clears it here.
+            report_runtime(roadmap_focus=scope if focused_round else None)
         sv = survey(
             w.cfg,
             w.gh,
@@ -1648,7 +1651,7 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     The counters are charged UP FRONT on purpose (an un-checkout-able PR must not loop), so a refund
     rather than a late charge is what keeps both properties. MAX_INFRA_REFUNDS bounds it in case a
     persistent PR-specific failure ever matches the transient patterns. Confirmed
-    subscription-limit refusals are independent of the PR and do not consume that allowance.
+    subscription and credit-limit refusals are independent of the PR and do not consume that allowance.
 
     That bound is keyed on the PR, NOT the head. Some of the counters refunded here are per-PR and
     lifetime or progress-scoped (`ci-pr-`, `bump-pr-`, rebase budgets), so a head-keyed allowance would reset on every
@@ -1668,12 +1671,9 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     reason = take_last_agent_infra_failure()
     if not reason:
         return
-    refunds = (
-        w.counters.read(f"infra-{label}-{c.pr}")
-        if reason == "provider subscription limit reached"
-        else w.counters.incr(f"infra-{label}-{c.pr}")
-    )
-    if refunds > MAX_INFRA_REFUNDS and reason != "provider subscription limit reached":
+    account_limit = reason in {"provider subscription limit reached", "provider credit balance exhausted"}
+    refunds = w.counters.read(f"infra-{label}-{c.pr}") if account_limit else w.counters.incr(f"infra-{label}-{c.pr}")
+    if refunds > MAX_INFRA_REFUNDS and not account_limit:
         warn_red(
             f"  {label} #{c.pr}: {reason}, but this head has already been refunded "
             f"{MAX_INFRA_REFUNDS} times — charging the attempt. If the provider really is down this "
@@ -1682,11 +1682,7 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
         return
     for key in charged:
         w.counters.write(key, max(0, w.counters.read(key) - 1))
-    detail = (
-        "subscription-limit refusal"
-        if reason == "provider subscription limit reached"
-        else f"refund {refunds}/{MAX_INFRA_REFUNDS}"
-    )
+    detail = "provider-limit refusal" if account_limit else f"refund {refunds}/{MAX_INFRA_REFUNDS}"
     log(
         f"  {label} #{c.pr}: {reason} — the agent never ran, so this attempt is not charged "
         f"({detail}); backing off and retrying later"
