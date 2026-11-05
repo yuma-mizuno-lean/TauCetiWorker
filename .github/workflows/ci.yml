@@ -28,7 +28,7 @@ jobs:
           enable-cache: true
           cache-suffix: test
       - name: Run the test suite
-        run: ./tests/run-all
+        run: ./tests/run-all -j "$(nproc)"
 
   lint:
     runs-on: ubuntu-24.04

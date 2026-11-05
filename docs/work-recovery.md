@@ -57,9 +57,20 @@ record is initially trusted only when every payload matches; restore always repe
 exact digest validation. Warm preparation may reuse that verification receipt while
 the manifest and every payload retain the same device, inode, size, mtime and ctime.
 A damaged record is reported as corrupt, kept, and
-replaced by a fresh copy. An interrupted save leaves at most a `.tmp-*`
-directory, which status reports as incomplete. Nothing in `state/*/recovery`
-is ever deleted automatically.
+replaced by a fresh copy. Normal exceptions and shutdown interruptions remove
+an unfinished `.tmp-*` save immediately. Foreground Git bundle creation has no fixed
+timeout, so growing history cannot cross an arbitrary bundle deadline. Background
+housekeeping still obeys its existing adaptive work budget. Failed saves leave the
+original checkout intact or retained under the ordinary guard.
+
+A hard kill can still leave a partial directory. Partials are disposable staging,
+not recovery records, and do not appear as operator recovery tasks. After one hour
+without new payload writes, background housekeeping abandons them to the existing
+bounded trash collector. Saves serialize on a per-worker `recovery-save.lock` lease
+inherited by Git children. Cleanup requires that lease plus clear live-use,
+verification-reference and mount checks, so it cannot remove an active save.
+This partial-save policy does not try to salvage `.tmp-*` contents. Completed saves
+have the separate finite lifetime described below.
 
 Excluded by name: dependency and build caches (`.lake`, `node_modules`,
 `__pycache__`, top-level `build`, `*.olean` and similar) and credential-like
@@ -226,6 +237,23 @@ clean local-only commits reuse their completed bundle; any dirty tree is saved
 before the reset, with independent payloads for each changed source snapshot.
 Finished and unrecoverable recovery records are removed from discovery and deleted by
 bounded activity housekeeping; they are not kept as an operator task history.
+All remaining completed saves have an absolute 24-hour lifetime from their immutable
+manifest creation time (manifest mtime for older/malformed timestamps). Retries,
+handoffs, journal updates and lack of model credits do not extend that lifetime.
+An exhausted original content allowance permits immediate abandonment. At expiry,
+metadata-only housekeeping removes the record from recovery discovery and hands its
+payloads to bounded trash deletion, even while paid workers are disabled. Pending
+or uncertain publication in a record does not authorize replay or extend its life;
+independent GitHub publication outboxes are untouched. This deliberately gives up
+unpublished edits once the limit is reached.
+
+Cleanup takes the existing recovery lock, checks live users and mounts, and protects
+a live receiving handoff round. Active use defers disposal until release; an old
+handoff label alone does not retain a record indefinitely, nor does an unrelated
+new round using the same checkout. Physical reclamation may take additional bounded
+collector passes. Metadata retirement has a durable cursor, separate from inventory
+and large payload deletion, so collector restarts cannot starve later records.
+Thus each inactive record retires by the first completed metadata sweep after its deadline, without paid work, GitHub queries, or human intervention.
 
 To roll back, set `TAUCETI_WORK_RECOVERY=off` (for example in a worker's `env`
 table). This stops index lookup/publication and background housekeeping, including
