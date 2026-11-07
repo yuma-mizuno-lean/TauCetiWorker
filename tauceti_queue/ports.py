@@ -52,6 +52,34 @@ class OpenPullRequest:
     base_ref: str
     draft: bool = False
     eligibility_checks: tuple[dict[str, Any], ...] = ()
+    # Complete primary policy inputs from the same discovery, without reading diff paths.
+    admission: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class AdmissionSnapshot:
+    """Fresh source evidence; obtaining it never executes code from the PR."""
+
+    pull: PullRequest
+    merge_base_sha: str
+    paths: tuple[str, ...]
+    comments: tuple[dict[str, Any], ...]
+    statuses: dict[str, str]
+    diff_version: str = ""
+
+    def source(self) -> dict[str, Any]:
+        return {
+            "head": self.pull.head_sha,
+            "base_ref": self.pull.base_ref,
+            "state": self.pull.state,
+            "draft": self.pull.draft,
+            "body": self.pull.body,
+            "labels": list(self.pull.labels),
+            "comments": list(self.comments),
+            "statuses": self.statuses,
+            "merge_base": self.merge_base_sha,
+            "diff_version": self.diff_version,
+        }
 
 
 @dataclass(frozen=True)
@@ -89,6 +117,7 @@ class CandidateRun:
     diagnostics: tuple[dict[str, Any], ...] = ()
     display_title: str = ""
     html_url: str = ""
+    updated_at: float | None = None  # the run's `updated_at`, which GitHub moves as its jobs report
 
 
 @dataclass(frozen=True)
@@ -127,14 +156,30 @@ class GitHubPort(Protocol):
 
     def fetch_pr(self, repo: str, number: int) -> PullRequest: ...
 
+    def declaration_names(self, repo: str, head_sha: str) -> dict:
+        """Compiled added names from the exact accepted revision's trusted PR-build log, or unknown."""
+        ...
+
     def fetch_refs(self, repo: str, refspecs: Sequence[str]) -> None:
         """Bring the named objects into the service's local clone (`git fetch origin <refspec>...`)."""
         ...
 
     def dispatch_candidate(
-        self, repo: str, *, head_sha: str, base_sha: str, base_ref: str, batch_id: str, members: Sequence[int]
+        self,
+        repo: str,
+        *,
+        head_sha: str,
+        base_sha: str,
+        base_ref: str,
+        batch_id: str,
+        members: Sequence[int],
+        repair_outputs_revs: Sequence[str] = (),
     ) -> str:
-        """`repository_dispatch` of `pr-build.yml` with event `tauceti-bors-staging`; returns a dispatch id."""
+        """`repository_dispatch` of `pr-build.yml` with event `tauceti-bors-staging`; returns a dispatch id.
+
+        `repair_outputs_revs` names the revisions whose published build outputs CI may restore when
+        none are published for `head_sha`, in the order to try them.
+        """
         ...
 
     def find_candidate_run(
@@ -145,6 +190,22 @@ class GitHubPort(Protocol):
         `since` is the dispatch time of the attempt being observed: an infrastructure re-dispatch
         of the same head, base and batch produces a second run with the same title, and the newest
         run created at or after `since` (less a minute of skew) is the one that answers for it.
+        """
+        ...
+
+    def read_run(self, repo: str, run_id: str, *, with_jobs: bool = False) -> CandidateRun | None:
+        """A direct read of one run (`GET /repos/{repo}/actions/runs/{run_id}`); `None` when GitHub has no such run.
+
+        The controller reads a run directly before it declares an in-progress run lost, and when a run
+        it was bound to no longer appears in the listing `find_candidate_run` reads.
+        """
+        ...
+
+    def cancel_run(self, repo: str, run_id: str) -> str:
+        """Cancel a queued or in-progress run (`POST /repos/{repo}/actions/runs/{run_id}/cancel`).
+
+        Returns `cancelled`, or `already-completed` when the run had finished; raises on any other failure.
+        The controller cancels the runs of attempts a newer dispatch, a landing or a rebuild superseded.
         """
         ...
 
@@ -166,6 +227,10 @@ class GitHubPort(Protocol):
         ...
 
     def set_labels(self, repo: str, number: int, add: Sequence[str], remove: Sequence[str]) -> None: ...
+
+    def ensure_label(self, repo: str, name: str, color: str, description: str) -> None:
+        """Create the repository label `name` unless it exists; an existing label is left as it is."""
+        ...
 
     def close_pr(self, repo: str, number: int, title: str) -> None:
         """`PATCH pulls/<number> {state: closed, title}`: how Bors closes a squash-landed member (not GitHub's merged state)."""
@@ -200,7 +265,12 @@ class GitHubPort(Protocol):
 
 @dataclass
 class TaskMember:
-    """A member as the repair task sees it: identity, accepted source, current commit and provenance."""
+    """A member as the repair task sees it: identity, accepted source, current commit and provenance.
+
+    `no_repair`: the PR carries a `no_repair_labels` label, so the agent must not edit it; if its content
+    needs a change the agent reduces it to an empty commit and names the interacting PR, file and finding
+    in the appended message. `withdrawn`: the queue already withdrew it that way; it stays an empty commit.
+    """
 
     source_pr: str
     number: int
@@ -212,21 +282,27 @@ class TaskMember:
     author: str = ""
     explanation: str = ""
     retained_ref: str = ""
+    no_repair: bool = False
+    withdrawn: bool = False
+    declaration_names: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class Task:
-    """A claimed repair or rebase-conflict task.
+    """A claimed repair, rebase-conflict or prepare task.
 
     `base` and `tip` are the chain the agent starts from. For a `rebase_conflict` task `onto` is
     the canonical commit the replacement chain must be based on and `tip` the chain that failed to
-    replay; for a `repair` task `onto` equals `base`. `diagnostics` are the CI findings (repair) or
-    the failed replay's conflict evidence (rebase conflict). `retained_refs` name the refs under
+    replay; a `pre_rebase` task is the same for the oldest open batch with `onto` the head's tip; for
+    a `repair` task `onto` equals `base`, and so for a `prepare` task, which builds and repairs an open
+    batch on its own base before it seals and carries no diagnostics. `diagnostics` are the CI findings
+    (repair) or the failed replay's conflict evidence (rebase conflict, pre-rebase, the latter with a
+    `cross_batch` entry). `retained_refs` name the refs under
     which the inputs and the current chain can be fetched.
     """
 
     task_id: int
-    kind: str  # "repair" or "rebase_conflict"
+    kind: str  # "repair", "rebase_conflict", "pre_rebase" or "prepare"
     repository: str
     batch_id: int
     batch_version: int
@@ -242,6 +318,10 @@ class Task:
     instruction: str
     created_at: float
     extra: dict[str, Any] = field(default_factory=dict)
+    # The revisions whose published repair outputs the worker restores before the agent runs, in
+    # order: for `pre_rebase` the head's tips then its base, for `prepare` the batch's previous tips
+    # then its base, for the head's `repair` and `rebase_conflict` its tips then its base and main.
+    warm_revs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -262,6 +342,7 @@ class Task:
             "instruction": self.instruction,
             "created_at": self.created_at,
             "extra": self.extra,
+            "warm_revs": list(self.warm_revs),
         }
 
 
@@ -272,7 +353,7 @@ class Adoption:
     `accepted` means the chain is now the batch's authoritative tip at `version`. A rejected
     submission keeps its commits retained under `retained_ref` so they can be reused; `reason` is a
     stable code (`claim-expired`, `claim-superseded`, `version-mismatch`, `not-authorized`,
-    `invalid-chain`, `explanation-required`, `unknown-task`) and `violations` carries the chain
+    `invalid-chain`, `explanation-required`, `no-repair-edited`, `unknown-task`) and `violations` carries the chain
     tool's findings when there are any.
     """
 

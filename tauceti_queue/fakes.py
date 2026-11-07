@@ -27,6 +27,7 @@ from typing import Any
 from . import chain
 from .controller import Controller
 from .ports import (
+    AdmissionSnapshot,
     Adoption,
     CandidatePhase,
     CandidateRun,
@@ -181,6 +182,9 @@ class FakeRun:
     runner_name: str = "fleet-runner-1"
     host: str = "chungus2"
     phases: list[CandidatePhase] = field(default_factory=list)
+    updated_at: float | None = None
+    # GitHub no longer reports the run at all (neither in the listing nor by id): a lost run.
+    vanished: bool = False
 
     def to_candidate_run(self) -> CandidateRun:
         return CandidateRun(
@@ -198,6 +202,7 @@ class FakeRun:
             diagnostics=tuple(self.diagnostics) if self.status == "completed" else (),
             display_title=f"bors branch={self.base_ref} batch={self.batch_id} head={self.head_sha} base={self.base_sha}",
             html_url=f"https://github.invalid/actions/runs/{self.run_id}",
+            updated_at=self.updated_at,
         )
 
 
@@ -221,10 +226,17 @@ class FakeGitHub:
         # When set, `repository_admin` raises `GitHubUnavailable` (a quota outage) with this message.
         self.unavailable: str | None = None
         self.comments: list[dict[str, Any]] = []
+        self.review_comments: dict[int, list[dict[str, Any]]] = {}
         self.labels: dict[int, set[str]] = {}
+        # Repository labels by name: (color, description).
+        self.repository_labels: dict[str, tuple[str, str]] = {}
         self.closed: dict[int, str] = {}
         self.statuses: dict[tuple[str, str], Status] = {}
+        self.declaration_records: dict[str, dict] = {}
         self.runs: list[FakeRun] = []
+        # pr-build.yml's concurrency group with cancel-in-progress: a new dispatch for a candidate
+        # cancels any queued or in-progress run for the same batch and head.
+        self.cancel_in_progress = True
         self.dispatches: list[dict[str, Any]] = []
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self.ci_policy: CIPolicy = always_pass
@@ -298,14 +310,18 @@ class FakeGitHub:
             return [run for run in self.runs if run.head_sha == head_sha]
 
     def start_runs(self) -> list[FakeRun]:
-        """Queued runs begin: a runner picks them up and the preparation phase starts."""
+        """Queued runs begin: a runner picks them up and the preparation phase starts. A run with
+        verdict `lost` vanishes instead: GitHub reports it neither in the listing nor by id."""
         with self.lock:
             started = []
             now = self.clock()
             for run in self.runs:
-                if run.status == "queued" and run.verdict != "lost":
+                if run.status == "queued" and run.verdict == "lost":
+                    run.vanished = True
+                elif run.status == "queued":
                     run.status = "in_progress"
                     run.started_at = now
+                    run.updated_at = now
                     run.phases = [CandidatePhase("preparation", now, None, "in_progress")]
                     started.append(run)
             return started
@@ -319,6 +335,7 @@ class FakeGitHub:
                         last = run.phases[-1]
                         run.phases[-1] = CandidatePhase(last.name, last.started_at, now, "completed", last.detail)
                     run.phases.append(CandidatePhase(phase, now, None, "in_progress", detail))
+                    run.updated_at = now
 
     def complete_runs(self) -> list[FakeRun]:
         """Running (or queued) runs finish according to their verdict; the finalizer posts the bound statuses."""
@@ -337,6 +354,7 @@ class FakeGitHub:
                 ]
                 run.status = "completed"
                 run.completed_at = now
+                run.updated_at = now
                 url = run.to_candidate_run().html_url
 
                 def post(context: str, state: str, description: str, target_url: str = url, run=run) -> None:
@@ -471,11 +489,30 @@ class FakeGitHub:
             run_git(self.repo.clone, "fetch", "-q", "--no-tags", str(self.repo.origin), *refspecs)
 
     def dispatch_candidate(
-        self, repo: str, *, head_sha: str, base_sha: str, base_ref: str, batch_id: str, members: Sequence[int]
+        self,
+        repo: str,
+        *,
+        head_sha: str,
+        base_sha: str,
+        base_ref: str,
+        batch_id: str,
+        members: Sequence[int],
+        repair_outputs_revs: Sequence[str] = (),
     ) -> str:
         with self.lock:
             self._call("dispatch_candidate", head_sha, base_sha, batch_id)
             self._run_counter += 1
+            if self.cancel_in_progress:
+                now = self.clock()
+                for older in self.runs:
+                    if (
+                        older.batch_id == batch_id
+                        and older.head_sha == head_sha
+                        and older.status != "completed"
+                        and not older.vanished
+                    ):
+                        older.status, older.conclusion = "completed", "cancelled"
+                        older.completed_at = older.updated_at = now
             verdict, diagnostics = self.ci_policy(head_sha, base_sha, members)
             run = FakeRun(
                 run_id=str(1000 + self._run_counter),
@@ -498,6 +535,7 @@ class FakeGitHub:
                     "batch_id": batch_id,
                     "members": list(members),
                     "base_ref": base_ref,
+                    "repair_outputs_revs": list(repair_outputs_revs),
                 },
                 "run_id": run.run_id,
             }
@@ -510,13 +548,39 @@ class FakeGitHub:
         with self.lock:
             self._call("find_candidate_run", batch_id, head_sha, base_sha)
             matching = [
-                r for r in self.runs if r.batch_id == batch_id and r.head_sha == head_sha and r.base_sha == base_sha
+                r
+                for r in self.runs
+                if r.batch_id == batch_id and r.head_sha == head_sha and r.base_sha == base_sha and not r.vanished
             ]
             if since is not None:
                 matching = [r for r in matching if r.created_at >= since - 60]
             if not matching:
                 return None
             return matching[-1].to_candidate_run()
+
+    def read_run(self, repo: str, run_id: str, *, with_jobs: bool = False) -> CandidateRun | None:
+        with self.lock:
+            self._call("read_run", run_id)
+            for run in self.runs:
+                if run.run_id == run_id and not run.vanished:
+                    return run.to_candidate_run()
+            return None
+
+    def cancel_run(self, repo: str, run_id: str) -> str:
+        with self.lock:
+            self._call("cancel_run", run_id)
+            for run in self.runs:
+                if run.run_id == run_id and not run.vanished:
+                    if run.status == "completed":
+                        return "already-completed"
+                    run.status, run.conclusion = "completed", "cancelled"
+                    run.completed_at = run.updated_at = self.clock()
+                    return "cancelled"
+            raise RuntimeError(f"HTTP 404 on POST repos/{repo}/actions/runs/{run_id}/cancel")
+
+    def declaration_names(self, repo: str, head_sha: str) -> dict:
+        self._call("declaration_names", repo, head_sha)
+        return self.declaration_records.get(head_sha, {"state": "unknown", "reason": "record_missing"})
 
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None:
         with self.lock:
@@ -580,6 +644,11 @@ class FakeGitHub:
             labels.difference_update(remove)
             labels.update(add)
 
+    def ensure_label(self, repo: str, name: str, color: str, description: str) -> None:
+        with self.lock:
+            self._call("ensure_label", name, color, description)
+            self.repository_labels.setdefault(name, (color, description))
+
     def close_pr(self, repo: str, number: int, title: str) -> None:
         with self.lock:
             self._call("close_pr", number, title)
@@ -617,7 +686,46 @@ class FakeGitHub:
             )
             return result.stdout.strip() or None if result.returncode == 0 else None
 
-    def list_open_pull_requests(self, repo: str, *, review_app_id: int) -> list[OpenPullRequest]:
+    def _admission_source(self, number):
+        pull = self.fetch_pr(self.repository, number)
+        base = self.pr_merge_base(self.repository, number, pull.head_sha) or ""
+        return {
+            "head": pull.head_sha,
+            "base_ref": pull.base_ref,
+            "state": pull.state,
+            "draft": pull.draft,
+            "body": pull.body,
+            "labels": list(pull.labels),
+            "comments": list(self.review_comments.get(number, [])),
+            "diff_version": base,
+            "statuses": {
+                context: status.state
+                for (head, context), status in self.statuses.items()
+                if head == pull.head_sha and context in ("build", "scope", "bump-guard")
+            },
+        }
+
+    def admission_snapshot(self, repo, number, *, generation=0):
+        self._call("admission_snapshot", number)
+        pull = self.fetch_pr(repo, number)
+        source = self._admission_source(number)
+        base = source["diff_version"]
+        if pull.state == "open" and not pull.draft:
+            self.fetch_refs(repo, [pull.head_sha, base])
+            paths = tuple(
+                p
+                for p in chain.git(
+                    self.repo.clone, "diff", "--name-only", "-z", "--no-renames", base, pull.head_sha
+                ).split("\0")
+                if p
+            )
+        else:
+            paths = ()
+        return AdmissionSnapshot(pull, base, paths, tuple(source["comments"]), source["statuses"], base)
+
+    def list_open_pull_requests(
+        self, repo: str, *, review_app_id: int, admission=False, on_page=None
+    ) -> list[OpenPullRequest]:
         with self.lock:
             self._call("list_open_pull_requests", review_app_id)
             listed = []
@@ -629,7 +737,18 @@ class FakeGitHub:
                     for c in self.checks.get(pr["head_sha"], [])
                     if c.get("name") == "merge eligibility" and (c.get("app") or {}).get("id") == review_app_id
                 )
-                listed.append(OpenPullRequest(number, pr["head_sha"], pr["base_ref"], pr["draft"], checks))
+                listed.append(
+                    OpenPullRequest(
+                        number,
+                        pr["head_sha"],
+                        pr["base_ref"],
+                        pr["draft"],
+                        checks,
+                        self._admission_source(number) if admission else None,
+                    )
+                )
+            if on_page:
+                on_page(listed)
             return listed
 
 

@@ -11,7 +11,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from tauceti_queue.store import Store, dumps, loads  # noqa: E402
+from tauceti_queue.store import Store, declared_columns, dumps, loads, read_settings  # noqa: E402
 
 
 class StoreTests(unittest.TestCase):
@@ -42,6 +42,19 @@ class StoreTests(unittest.TestCase):
         again = Store(self.path)
         self.addCleanup(again.close)
         self.assertEqual(again.count("batches"), 0)
+
+    def test_opening_an_older_database_adds_every_declared_column(self):
+        path = str(Path(self.tmp.name) / "older.sqlite")
+        connection = sqlite3.connect(path)
+        # Each table with only its first column, as if every later column were declared after it existed.
+        for table, columns in declared_columns().items():
+            connection.execute(f"CREATE TABLE {table} ({columns[0][0]} {columns[0][1]} PRIMARY KEY)")
+        connection.close()
+        store = Store(path)
+        self.addCleanup(store.close)
+        for table, columns in declared_columns().items():
+            present = [row["name"] for row in store.execute(f"PRAGMA table_info({table})")]
+            self.assertEqual(present, [name for name, _ in columns], table)
 
     def test_insert_update_rows_and_where_forms(self):
         first = self.store.insert("batches", repository="o/r", base="a", tip="a", state="open", created_at=1.0)
@@ -88,6 +101,17 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(settings["insertion_age_window"], {"value": 8, "actor": "kim", "updated_at": 12.0})
         self.store.set_setting("inference_hold", None, "controller", 13.0)
         self.assertIsNone(self.store.get_setting("inference_hold", "unset"))
+        self.assertEqual(self.store.setting_record("insertion_age_window"), settings["insertion_age_window"])
+        self.assertIsNone(self.store.setting_record("missing"))
+
+    def test_read_settings_reads_without_writing(self):
+        self.store.set_setting("repair_concurrency", 2, "kim-em", 10.0)
+        self.assertEqual(
+            read_settings(self.path)["repair_concurrency"], {"value": 2, "actor": "kim-em", "updated_at": 10.0}
+        )
+        absent = str(Path(self.tmp.name) / "absent.sqlite")
+        self.assertIsNone(read_settings(absent))
+        self.assertFalse(Path(absent).exists(), "a read-only read creates no database")
 
     def test_journal_entries_decode_detail(self):
         self.store.journal(1.0, "sealed", 4, size=3, urgent=False)

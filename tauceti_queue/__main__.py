@@ -2,7 +2,9 @@
 
     tauceti-queue serve [--config FILE]
         Load the configuration, open the store, authenticate the GitHub App, build the controller,
-        start the HTTP server and the reconciliation loop; record the running revision and start
+        seed the store with the file's runtime controls (only for keys the store has no value for,
+        or whose stored value is an earlier seed; an operator's value is never replaced), start the
+        HTTP server and the reconciliation loop; record the running revision and start
         time for `/status`. SIGTERM or SIGINT finishes the current reconciliation step, stops the
         server and closes the store before exiting 0.
     tauceti-queue status [--url URL] [--json] [--wait SECONDS] [--expect-revision SHA]
@@ -11,12 +13,18 @@
         `services/queue/install.sh` verifies a deployment.
     tauceti-queue check-config [--config FILE] [--json] [--print KEY]
         Print the effective configuration with the source of every value and the problems that
-        would stop `serve`; exit 1 when there are any.
+        would stop `serve`; exit 1 when there are any. For the runtime controls (`[settings]` and
+        `publication_enabled`) it reads the store without writing and shows the effective value:
+        the store's, with the actor that wrote it, or the file's while the store has none.
     tauceti-queue settings show [--url URL]
     tauceti-queue settings set KEY VALUE [--url URL] [--token TOKEN]
-        Read or change the runtime controls through the service's admin endpoint. The token is the
-        operator's GitHub token (`--token`, `GITHUB_TOKEN`, or `gh auth token`); the service checks
-        repository-admin permission with the same predicate as the security audit.
+        Read or change the runtime controls through the service's admin endpoint. KEY is any key of
+        the controller's `DEFAULT_SETTINGS`; VALUE is parsed by the type of that key's initial value
+        (a non-negative integer, at least 1 for the `[settings]` keys of the configuration file,
+        `true`/`false`, or text). The command posts `{"KEY": VALUE}` to `/admin/settings`, whose body
+        is one JSON object of setting keys to values. The token is the operator's GitHub token
+        (`--token`, `GITHUB_TOKEN`, or `gh auth token`); the service checks repository-admin
+        permission with the same predicate as the security audit.
     tauceti-queue import-bors --feed URL|FILE [--candidates URL|FILE ...] [--dry-run] [--release-head]
         The cutover import (`tauceti_queue.bors_import`): read Bors's observation feed and candidate
         journals, post them to the service's `/admin/import-bors` endpoint, print what was (or, with
@@ -133,21 +141,43 @@ class Service:
             revision=self.runtime.revision.sha,
             canonical_branch=self.config.canonical_branch or None,
         )
-        # Configuration supplies the initial runtime controls; the admin endpoint changes them later.
-        for key, value in {
-            **self.config.settings.as_dict(),
-            "publication_enabled": self.config.publication_enabled,
-        }.items():
-            try:
-                self.controller.set_setting(key, value, "configuration")
-            except Exception as error:  # noqa: BLE001 - an unknown key in the file is reported, not fatal
-                _log(f"configuration setting {key} not applied: {error}")
         self.loop_module = _optional("loop")
         poll_module = _optional("approval_poll")
         if poll_module is not None and hasattr(self.github, "list_open_pull_requests"):
-            self.poller = poll_module.ApprovalPoller(
-                self.controller, self.github, self.config.repository, review_app_id=self.config.review_app_id
-            )
+            if self.config.admission_source == "policy":
+                from .admission import AdmissionPolicy, AdmissionPoller, policy
+
+                root = self.config.admission_lean_root
+                self.poller = AdmissionPoller(
+                    self.controller,
+                    self.github,
+                    self.config.repository,
+                    AdmissionPolicy(
+                        rubrics=self.config.admission_rubrics.split(","),
+                        prefix=root.replace(".", "/") + "/",
+                        allow_files=policy.default_allow_files(root)
+                        + [s for s in self.config.admission_extra_files.split(",") if s],
+                    ),
+                )
+            else:
+                self.poller = poll_module.ApprovalPoller(
+                    self.controller, self.github, self.config.repository, review_app_id=self.config.review_app_id
+                )
+
+    def seed_settings(self) -> None:
+        """Seed the store with the configuration file's runtime controls (`serve` only).
+
+        A file value is written only when the store has no value for the key, or when the stored
+        value is an earlier seed the file has since changed; a value an operator set through
+        `/admin/settings` or `tauceti-queue settings set` is kept (`Controller.seed_setting`)."""
+        if self.controller is None:
+            return
+        for key, value in configuration.runtime_settings(self.config).items():
+            try:
+                if self.controller.seed_setting(key, value):
+                    _log(f"configuration seeded {key} = {value!r}")
+            except Exception as error:  # noqa: BLE001 - an unknown key in the file is reported, not fatal
+                _log(f"configuration setting {key} not applied: {error}")
 
     def status_document(self, *, wait: float | None = None) -> dict[str, Any]:
         """The status envelope; `wait` bounds the wait for the controller lock (`Controller.status`)."""
@@ -239,6 +269,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     service.open_store()
     service.open_github()
     service.build_controller()
+    service.seed_settings()
     if service.controller is None:
         _log(f"controller unavailable: {service.unavailable_reason}; serving status only")
     service.start_server()
@@ -311,6 +342,15 @@ def cmd_status(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = 
 # --- check-config ----------------------------------------------------------------------------------
 
 
+def _stored_settings(config: Config) -> dict[str, dict[str, Any]] | None:
+    """The store's settings rows, read without writing; None when there is no store yet."""
+    module = _optional("store")
+    reader = getattr(module, "read_settings", None)
+    if reader is None or not config.database.is_file():
+        return None
+    return reader(str(config.database))
+
+
 def cmd_check_config(args: argparse.Namespace) -> int:
     try:
         config = configuration.load(args.config)
@@ -318,6 +358,7 @@ def cmd_check_config(args: argparse.Namespace) -> int:
         _log(str(exc))
         return 1
     problems = configuration.validate(config)
+    stored = _stored_settings(config)
     if args.print:
         values = config.as_dict()
         if args.print not in values:
@@ -327,9 +368,14 @@ def cmd_check_config(args: argparse.Namespace) -> int:
         print(json.dumps(value) if isinstance(value, dict | list | bool) or value is None else value)
         return 0
     if args.json:
-        print(json.dumps({**config.as_dict(), "problems": problems}, indent=2, sort_keys=True))
+        document = {
+            **config.as_dict(),
+            "effective_settings": configuration.effective_runtime_settings(config, stored),
+            "problems": problems,
+        }
+        print(json.dumps(document, indent=2, sort_keys=True))
     else:
-        print(configuration.format_effective(config, problems))
+        print(configuration.format_effective(config, problems, stored))
     return 1 if problems else 0
 
 
@@ -348,6 +394,41 @@ def _operator_token(explicit: str | None) -> str:
     return token.strip()
 
 
+def settable_settings() -> dict[str, Any]:
+    """Every runtime setting `settings set` may change, with its initial value: the controller's
+    `DEFAULT_SETTINGS` (the configuration file's `[settings]` when the controller is not installed)."""
+    try:
+        from .controller import DEFAULT_SETTINGS
+    except ImportError:
+        return configuration.Settings().as_dict()
+    return dict(DEFAULT_SETTINGS)
+
+
+_TRUE = ("true", "yes", "on", "1")
+_FALSE = ("false", "no", "off", "0")
+
+
+def parse_setting_value(key: str, raw: str) -> Any:
+    """`raw` as the type of `key`'s initial value; raises ValueError with a message for the operator."""
+    initial = settable_settings()[key]
+    if isinstance(initial, bool):
+        if raw.lower() in _TRUE:
+            return True
+        if raw.lower() in _FALSE:
+            return False
+        raise ValueError(f"{key} takes true or false, got {raw!r}")
+    if isinstance(initial, int):
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{key} takes an integer, got {raw!r}") from None
+        minimum = 1 if key in configuration.SETTING_FIELDS else 0
+        if value < minimum:
+            raise ValueError(f"{key} must be at least {minimum}")
+        return value
+    return raw
+
+
 def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
     base = _status_url(args)
     try:
@@ -355,16 +436,14 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
             document = fetch(base + "/settings")
             print(json.dumps(document, indent=2, sort_keys=True))
             return 0
-        if args.key not in configuration.SETTING_FIELDS:
-            _log(f"unknown setting {args.key!r}; known: {', '.join(configuration.SETTING_FIELDS)}")
+        known = settable_settings()
+        if args.key not in known:
+            _log(f"unknown setting {args.key!r}; known: {', '.join(known)}")
             return 1
         try:
-            value = int(args.value)
-        except ValueError:
-            _log(f"{args.key} takes an integer, got {args.value!r}")
-            return 1
-        if value < 1:
-            _log(f"{args.key} must be at least 1")
+            value = parse_setting_value(args.key, args.value)
+        except ValueError as exc:
+            _log(str(exc))
             return 1
         document = fetch(
             base + "/admin/settings", method="POST", body={args.key: value}, token=_operator_token(args.token)
@@ -451,9 +530,14 @@ def build_parser() -> argparse.ArgumentParser:
     settings.add_argument("--config", help="configuration file used to find the listen address")
     actions = settings.add_subparsers(dest="action", required=True)
     actions.add_parser("show", help="print the effective settings")
-    setter = actions.add_parser("set", help="change one setting through the admin endpoint")
-    setter.add_argument("key", choices=configuration.SETTING_FIELDS)
-    setter.add_argument("value")
+    setter = actions.add_parser(
+        "set",
+        help="change one setting through the admin endpoint",
+        description="Post {KEY: VALUE} to /admin/settings. KEY is any controller setting; VALUE is parsed "
+        "by the type of its initial value (integer, true/false, or text).",
+    )
+    setter.add_argument("key", choices=sorted(settable_settings()), metavar="KEY", help="the setting to change")
+    setter.add_argument("value", metavar="VALUE", help="the new value")
     setter.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
 
     importer = commands.add_parser("import-bors", help="import Bors's approved PRs and running head at the cutover")

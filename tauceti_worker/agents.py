@@ -40,7 +40,7 @@ from .constants import (
     TAUCETI,
 )
 from .github import me
-from .paths import HERE
+from .paths import HERE, legacy_data_root
 from .processes import PARENT_BOUND_AGENT as _PARENT_BOUND_AGENT
 from .processes import owned_process
 from .processes import run as run_process
@@ -883,6 +883,10 @@ def host_agent_argv(
         if profile.effort:
             argv += ["--effort", profile.effort]
         argv += ["--dangerously-skip-permissions"]
+        if shell_env := env.get("TAUCETI_REPAIR_CLAUDE_ENV_FILE"):
+            # Queue-owned startup configuration must beat project/user env settings.
+            # Explicit command redirections still override this default Bash stdin.
+            argv += ["--settings", json.dumps({"env": {"CLAUDE_ENV_FILE": shell_env}})]
     return argv, env
 
 
@@ -898,10 +902,18 @@ def run_agent_host(
     session_actor=None,
     session_scope=None,
     quota_cfg=None,
+    cache_note: bool = True,
 ) -> int:
+    """``cache_note=False`` leaves out the build-cache appendix (fetch commands and the
+    ``TAUCETI_PR_CACHE_MISS`` stop rule): the queue's repair worker warms the tree itself and its own
+    prompt tells the agent not to fetch, and a queue head's tip is never in the public cache."""
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
-    if TAUCETI_CACHE_SERVICE and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+    if (
+        cache_note
+        and TAUCETI_CACHE_SERVICE
+        and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
+    ):
         prompt += (
             "\n\nBuild cache preparation: the worker attempted to warm Mathlib and TauCeti artifacts for this "
             "checkout and current main. The public `tauceti-public` Lake service remains configured "
@@ -960,12 +972,16 @@ def run_agent_host(
 
         with contextlib.suppress(ValueError, subprocess.CalledProcessError):
             env["TAUCETI_VERIFY_BASE"] = local_main(cwd)
-    env.setdefault("TAUCETI_VERIFY_STATE", str(HERE / "state" / env.get("TAUCETI_WORKER_ID", "local")))
+    env.setdefault(
+        "TAUCETI_VERIFY_STATE", str(legacy_data_root(HERE) / "state" / env.get("TAUCETI_WORKER_ID", "local"))
+    )
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
     _LAST_AGENT_FAILURE = None
     with host_build_cache_context(cwd, env, logdir) as prefix:
+        if not cache_note:
+            env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
         rc = run_agent_proc(
             [*(prefix or []), *argv],
             env=env,
@@ -2908,7 +2924,7 @@ def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
     if project and not project.legacy:
         return project.state_root / "workers" / wid / "home"
     if sys.platform != "darwin":
-        return HERE / "state" / wid / "home"
+        return legacy_data_root(HERE) / "state" / wid / "home"
     base = _base
     if base is None:
         try:

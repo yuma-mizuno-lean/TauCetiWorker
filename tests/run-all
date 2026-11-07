@@ -62,10 +62,13 @@ RUN_STDLIB=(
   usage_supervisor.py
   queue_repair_experiment.py
   queue_repair_task.py
+  queue_claude_stdin.py
   expanded_cache.py
   cache_storage.py
   local_lint.py
   lean_pressure.py
+  repair_pressure.py
+  repair_parallel_fold.py
   shared_mathlib.py
   agent_cmds.py
   agent_transcript.py
@@ -89,6 +92,7 @@ RUN_STDLIB=(
   fix_diagnostic.py
   fork_authoring.py
   fleet_capacity.py
+  forge_inventory.py
   github_accounts.py
   github_failure_reason.py
   github_ratelimit.py
@@ -112,6 +116,7 @@ RUN_STDLIB=(
   infra_failure_budget.py
   isolate_home_macos.py
   isolate_home_paths.py
+  legacy_data_root.py
   kiro.py
   local_verification_scope.py
   local_axioms.py
@@ -150,8 +155,16 @@ RUN_STDLIB=(
   queue_eligibility.py
   queue_diagnostics.py
   queue_controller.py
+  queue_monitoring.py
+  queue_task_progress.py
+  queue_monitoring_protocol.py
+  queue_monitoring_history.py
+  queue_admission_planning.py
   queue_fixture.py
   queue_store.py
+  queue_admission_state.py
+  queue_admission.py
+  queue_admission_adapter.py
   queue_config.py
   queue_cli.py
   queue_rehearsal.py

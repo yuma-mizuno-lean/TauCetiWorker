@@ -23,9 +23,12 @@ build ...`` runs one command under the sandbox (the helper scripts' entry point)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,20 +36,21 @@ from pathlib import Path
 
 DISABLE_VARIABLE = "TAUCETI_QUEUE_SANDBOX"
 LOGGER = logging.getLogger("tauceti_queue.repair_sandbox")
+PRESSURE_WRAPPER = "/opt/tauceti/tauceti-lean"
 
 # Read-only system roots, bound when present. A symlinked root (``/bin -> usr/bin``) is recreated as
 # the same symlink, the way CI's ``--symlink usr/bin /bin`` does.
 SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/nix", "/run/current-system")
 # Lake's artifact-cache settings, passed through from the build's environment as CI passes them.
 PASSED_ENV = ("LAKE_ARTIFACT_CACHE", "LAKE_RESTORE_ARTIFACTS", "LAKE_CACHE_DIR", "LAKE_CONFIG", "ELAN_HOME")
-# CI's namespace flags, verbatim.
+# Retain the caller's cgroup namespace: the pressure wrapper needs every capped ancestor,
+# with /proc/self/cgroup paths matching the read-only host cgroup mount.
 NAMESPACE_FLAGS = (
     "--unshare-user",
     "--unshare-ipc",
     "--unshare-pid",
     "--unshare-net",
     "--unshare-uts",
-    "--unshare-cgroup",
     "--disable-userns",
     "--die-with-parent",
     "--new-session",
@@ -117,9 +121,79 @@ def _inside_path(env: dict, elan: Path) -> str:
     return ":".join(entries)
 
 
-def sandbox_argv(argv: list[str], worktree: Path, env: dict | None = None, *, bwrap: str | None = None) -> list[str]:
-    """``argv`` wrapped in the offline sandbox, run from ``worktree``. Raises
-    :class:`SandboxUnavailable` when ``bwrap`` is not on PATH."""
+def _pressure_env(worktree: Path, wrapper: str) -> dict[str, str]:
+    """Reuse the worker's compiler gate, with its disposable overlay in writable build state."""
+    return {
+        "LAKE_OVERRIDE_LEAN": "true",
+        "LEAN": wrapper,
+        "XDG_CACHE_HOME": str(worktree / ".lake" / "pressure-cache"),
+    }
+
+
+def _pressure_source() -> Path:
+    # Keep this helper stdlib-only: the agent's build script may use system Python.
+    # Wheels bundle assets inside tauceti_worker; source checkouts keep them at the root.
+    package = Path(__file__).resolve().parent.parent / "tauceti_worker"
+    root = package if (package / "prompts").is_dir() else package.parent
+    source = root / "scripts" / "tauceti-lean"
+    if not source.is_file():
+        raise SandboxUnavailable(f"the worker's bundled compiler pressure wrapper is missing: {source}")
+    return source
+
+
+def _pressure_executable(worktree: Path) -> Path:
+    source = _pressure_source()
+    if os.access(source, os.X_OK):
+        return source
+    # Wheel assets may be read-only and lack execute permission. Never modify the installation.
+    content = source.read_bytes()
+    name = "tauceti-lean-" + hashlib.sha256(content).hexdigest()
+    cache = worktree / ".lake" / "pressure-cache"
+    # Candidate build state is writable: do not follow symlinks when creating the trusted copy.
+    lake_fd = os.open(worktree / ".lake", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            os.mkdir("pressure-cache", 0o700, dir_fd=lake_fd)
+        except FileExistsError:
+            pass
+        cache_fd = os.open("pressure-cache", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=lake_fd)
+    finally:
+        os.close(lake_fd)
+    temporary = ".wrapper-" + secrets.token_hex(12)
+    try:
+        try:
+            existing_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cache_fd)
+            with os.fdopen(existing_fd, "rb") as existing:
+                mode = os.fstat(existing.fileno()).st_mode
+                if stat.S_ISREG(mode) and mode & stat.S_IXUSR and existing.read(len(content) + 1) == content:
+                    return cache / name
+        except OSError:
+            pass
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=cache_fd)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+            os.fchmod(output.fileno(), 0o755)
+        os.replace(temporary, name, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
+        return cache / name
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=cache_fd)
+        except FileNotFoundError:
+            pass
+        os.close(cache_fd)
+
+
+def sandbox_argv(
+    argv: list[str],
+    worktree: Path,
+    env: dict | None = None,
+    *,
+    bwrap: str | None = None,
+    extra_env: dict | None = None,
+) -> list[str]:
+    """``argv`` wrapped in the offline sandbox, run from ``worktree``, with ``extra_env`` set inside it
+    (the audit and lint scripts' inputs, ``repair_audit``). Raises :class:`SandboxUnavailable` when
+    ``bwrap`` is not on PATH."""
     env = dict(os.environ if env is None else env)
     bwrap = bwrap or shutil.which("bwrap")
     if not bwrap:
@@ -132,6 +206,9 @@ def sandbox_argv(argv: list[str], worktree: Path, env: dict | None = None, *, bw
     home = env.get("HOME") or os.path.expanduser("~")
     args = [shutil.which("env") or "/usr/bin/env", "-i", bwrap, "--tmpfs", "/", *_system_binds()]
     args += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    args += ["--ro-bind", str(_pressure_executable(worktree)), PRESSURE_WRAPPER]
+    if Path("/sys/fs/cgroup").is_dir():
+        args += ["--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup"]
     if elan.is_dir():
         args += ["--ro-bind", str(elan), str(elan)]
     git_dir = _git_dir(worktree)
@@ -156,17 +233,32 @@ def sandbox_argv(argv: list[str], worktree: Path, env: dict | None = None, *, bw
     for key in PASSED_ENV:
         if env.get(key):
             args += ["--setenv", key, env[key]]
+    for key, value in (extra_env or {}).items():
+        args += ["--setenv", key, str(value)]
+    for key, value in _pressure_env(worktree, PRESSURE_WRAPPER).items():
+        args += ["--setenv", key, value]
     args += ["--chdir", str(worktree), *NAMESPACE_FLAGS, "--", *argv]
     return args
 
 
-def sandboxed_lake(argv: list[str], worktree: Path, env: dict | None = None) -> list[str]:
+def sandboxed_lake(
+    argv: list[str], worktree: Path, env: dict | None = None, *, extra_env: dict | None = None
+) -> list[str]:
     """The command to run for ``argv`` (a ``lake build ...``) from ``worktree``: wrapped in the
-    sandbox, or ``argv`` itself with a logged warning when ``TAUCETI_QUEUE_SANDBOX=0``."""
+    sandbox, or an environment wrapper with a logged warning when ``TAUCETI_QUEUE_SANDBOX=0``
+    (the caller then passes ``extra_env`` in the process environment). Both paths gate compilation."""
     if disabled():
         warn_disabled(argv)
-        return list(argv)
-    return sandbox_argv(argv, worktree, env)
+        worktree = Path(worktree).resolve()
+        (worktree / ".lake").mkdir(exist_ok=True)
+        return [
+            shutil.which("env") or "/usr/bin/env",
+            "-u",
+            "LEAN_SYSROOT",
+            *(f"{key}={value}" for key, value in _pressure_env(worktree, str(_pressure_executable(worktree))).items()),
+            *argv,
+        ]
+    return sandbox_argv(argv, worktree, env, extra_env=extra_env)
 
 
 def check(scratch: Path | None = None, env: dict | None = None) -> tuple[bool, str]:

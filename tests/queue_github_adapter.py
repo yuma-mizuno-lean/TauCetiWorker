@@ -180,6 +180,60 @@ def client(transport, clock=None):
 
 
 class Client(unittest.TestCase):
+    def test_deferred_wait_keeps_original_deadline_and_other_bucket_runs(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/x",
+            403,
+            {},
+            {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1800007200"},
+        )
+        transport.add("POST", "https://api.github.com/graphql", 200, {"data": {"ok": True}})
+        c, clock = client(transport)
+        with c.deferred_requests():
+            with self.assertRaises(ga.RateLimited) as first:
+                c.get_json("x")
+            self.assertEqual((first.exception.resource, first.exception.retry_at), ("core", 1800007201))
+            clock.now += 30
+            with self.assertRaises(ga.RateLimited) as again:
+                c.get_json("a-different-pr")
+            self.assertEqual(again.exception.retry_at, first.exception.retry_at)
+            self.assertEqual(c.graphql("query { ok }"), {"ok": True})
+        self.assertEqual(clock.slept, [])
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_graphql_http_success_rate_error_is_retryable_and_independent(self):
+        transport = FakeTransport()
+        transport.add(
+            "POST",
+            "https://api.github.com/graphql",
+            200,
+            {"errors": [{"type": "RATE_LIMITED", "message": "quota exhausted"}]},
+            {"X-RateLimit-Reset": "1800003600"},
+        )
+        transport.add("GET", "https://api.github.com/x", 200, {"ok": True})
+        c, clock = client(transport)
+        with c.deferred_requests():
+            with self.assertRaises(ga.RateLimited) as limited:
+                c.graphql("query { ok }")
+            self.assertEqual((limited.exception.resource, limited.exception.retry_at), ("graphql", 1800003601))
+            self.assertEqual(c.get_json("x")[1], {"ok": True})
+            with self.assertRaises(ga.RateLimited):
+                c.graphql("query { ok }")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(clock.slept, [])
+
+    def test_short_secondary_wait_is_persistable_without_blocking_intake(self):
+        transport = FakeTransport()
+        transport.add("GET", "https://api.github.com/x", 429, {}, {"Retry-After": "7"})
+        c, clock = client(transport)
+        with c.deferred_requests(), self.assertRaises(ga.RateLimited) as limited:
+            c.get_json("x")
+        self.assertEqual(limited.exception.retry_at, clock.now + 7)
+        self.assertEqual(limited.exception.resource, "secondary")
+        self.assertEqual(clock.slept, [])
+
     def test_records_rate_limit_and_counts(self):
         transport = FakeTransport()
         transport.add(
@@ -287,6 +341,96 @@ def adapter(transport, git=None):
 
 
 class Adapter(unittest.TestCase):
+    def test_declaration_names_uses_exact_successful_status_run_attempt_and_job(self):
+        from tauceti_queue import declaration_names as dn
+
+        raw = dict(
+            version=1,
+            head=HEAD,
+            base=BASE,
+            tested=TIP,
+            complete=True,
+            added={"TauCeti.A": ["Ns.shared", "Ns.shared", "Ns.α"]},
+        )
+
+        def setup(url=None, workflow=".github/workflows/pr-build.yml", log=None, jobs=None):
+            t = FakeTransport()
+            t.add(
+                "GET",
+                f"https://api.github.com/repos/{TAUCETI}/commits/{HEAD}/statuses?per_page=100",
+                200,
+                [
+                    {
+                        "context": "build",
+                        "state": "success",
+                        "target_url": url or f"https://github.com/{TAUCETI}/actions/runs/123",
+                    }
+                ],
+            )
+            t.add(
+                "GET",
+                f"https://api.github.com/repos/{TAUCETI}/actions/runs/123",
+                200,
+                {"path": workflow, "run_attempt": 2},
+            )
+            t.add(
+                "GET",
+                f"https://api.github.com/repos/{TAUCETI}/actions/runs/123/attempts/2/jobs?per_page=100",
+                200,
+                {
+                    "total_count": 1,
+                    "jobs": jobs
+                    if jobs is not None
+                    else [{"id": 55, "name": "sandboxed-build", "status": "completed", "conclusion": "success"}],
+                },
+            )
+            t.add(
+                "GET",
+                f"https://api.github.com/repos/{TAUCETI}/actions/jobs/55/logs",
+                200,
+                (log if log is not None else "2026-11-05T01:00:00.000Z DECLARATION-NAMES " + json.dumps(raw)).encode(),
+            )
+            return adapter(t), t
+
+        a, t = setup()
+        record = a.declaration_names(TAUCETI, HEAD)
+        self.assertEqual(record["added"], {"TauCeti.A": ["Ns.shared", "Ns.α"]})
+        self.assertEqual(
+            (record["head"], record["base"], record["tested"], record["job_id"], record["run_attempt"]),
+            (HEAD, BASE, TIP, 55, 2),
+        )
+        self.assertEqual(len(t.calls), 4)
+        for url in [
+            f"https://evil.test/{TAUCETI}/actions/runs/123",
+            "https://github.com/other/repo/actions/runs/123",
+            f"https://github.com/{TAUCETI}/actions/runs/123?x=1",
+        ]:
+            a, t = setup(url=url)
+            self.assertEqual(a.declaration_names(TAUCETI, HEAD)["state"], "unknown")
+            self.assertEqual(len(t.calls), 1)
+        a, t = setup(workflow=".github/workflows/untrusted.yml")
+        self.assertEqual(a.declaration_names(TAUCETI, HEAD)["state"], "unknown")
+        self.assertEqual(len(t.calls), 2)
+        a, _ = setup(jobs=[{"id": 55, "name": "sandboxed-build"}, {"id": 56, "name": "sandboxed-build"}])
+        self.assertEqual(a.declaration_names(TAUCETI, HEAD)["reason"], "build_job_ambiguous")
+        self.assertEqual(dn.parse_log("DECLARATION-NAMES " + json.dumps(raw), BASE)["reason"], "head_mismatch")
+        for invalid in [
+            dict(raw, complete=False, added={}),
+            dict(raw, base="not-a-sha"),
+            dict(raw, added={"../oops": ["x"]}),
+            dict(raw, added={"TauCeti.A": ["bad name"]}),
+        ]:
+            self.assertNotIn(
+                dn.parse_log("DECLARATION-NAMES " + json.dumps(invalid), HEAD)["state"], ("known", "empty")
+            )
+        line = "DECLARATION-NAMES " + json.dumps(raw)
+        self.assertEqual(dn.parse_log(line + "\n" + line, HEAD)["reason"], "multiple_records")
+        self.assertEqual(
+            dn.parse_log(line.replace('"version": 1', '"version": 1, "version": 1'), HEAD)["reason"], "invalid_json"
+        )
+        self.assertEqual(dn.parse_log("nothing", HEAD)["reason"], "record_missing")
+        self.assertEqual(dn.parse_log("DECLARATION-NAMES " + json.dumps(dict(raw, added={})), HEAD)["state"], "empty")
+
     def test_fetch_pr(self):
         transport = FakeTransport()
         transport.add("GET", f"https://api.github.com/repos/{TAUCETI}/pulls/42", 200, pr_json())
@@ -315,13 +459,31 @@ class Adapter(unittest.TestCase):
         self.assertEqual(a.pr_merge_base(TAUCETI, 42, HEAD), "d" * 40)
         self.assertIsNone(a.pr_merge_base(TAUCETI, 42, "e" * 40), "a moved head gets no merge base")
 
+    def test_cancel_run(self):
+        transport = FakeTransport()
+        base = f"https://api.github.com/repos/{TAUCETI}/actions/runs"
+        transport.add("POST", f"{base}/1/cancel", 202, {})
+        transport.add("POST", f"{base}/2/cancel", 409, {"message": "Cannot cancel a workflow run that is completed."})
+        transport.add("POST", f"{base}/3/cancel", 403, {"message": "Resource not accessible by integration"})
+        a = adapter(transport)
+        self.assertEqual(a.cancel_run(TAUCETI, "1"), "cancelled")
+        self.assertEqual(a.cancel_run(TAUCETI, "2"), "already-completed")
+        with self.assertRaises(ga.GitHubError):
+            a.cancel_run(TAUCETI, "3")
+
     def test_dispatch_candidate_sends_the_bors_payload(self):
         transport = FakeTransport()
         transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/dispatches", 204)
         a = adapter(transport)
         members = [{"pr": 1, "head_sha": "1" * 40}, {"pr": 2, "head_sha": "2" * 40}]
         dispatch_id = a.dispatch_candidate(
-            TAUCETI, head_sha=HEAD, base_sha=BASE, base_ref="main", batch_id=2650, members=members
+            TAUCETI,
+            head_sha=HEAD,
+            base_sha=BASE,
+            base_ref="main",
+            batch_id=2650,
+            members=members,
+            repair_outputs_revs=["e" * 40, BASE],
         )
         self.assertEqual(dispatch_id, f"bors branch=main batch=2650 head={HEAD} base={BASE}")
         body = json.loads(transport.calls[0][3])
@@ -335,6 +497,7 @@ class Adapter(unittest.TestCase):
                     "batch_id": 2650,
                     "members": members,
                     "base_ref": "main",
+                    "repair_outputs_revs": ["e" * 40, BASE],
                 },
             },
         )
@@ -685,6 +848,21 @@ class Adapter(unittest.TestCase):
         a.set_labels(TAUCETI, 42, ["on-queue"], ["awaiting-requeue", "roadmap/X"])
         self.assertEqual(json.loads(transport.calls[0][3]), {"labels": ["on-queue"]})
         self.assertEqual(len(transport.calls), 3)
+
+    def test_ensure_label(self):
+        transport = FakeTransport()
+        transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/labels", 201, {"name": "repaired-in-queue"})
+        transport.add(
+            "POST", f"https://api.github.com/repos/{TAUCETI}/labels", 422, {"errors": [{"code": "already_exists"}]}
+        )
+        a = adapter(transport)
+        a.ensure_label(TAUCETI, "repaired-in-queue", "d4c5f9", "Modified by the queue")
+        self.assertEqual(
+            json.loads(transport.calls[0][3]),
+            {"name": "repaired-in-queue", "color": "d4c5f9", "description": "Modified by the queue"},
+        )
+        a.ensure_label(TAUCETI, "repaired-in-queue", "d4c5f9", "Modified by the queue")
+        self.assertEqual(len(transport.calls), 2, "an existing label is not an error")
 
     def test_permissions(self):
         transport = FakeTransport()

@@ -37,11 +37,12 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
-from tauceti_queue import repair_sandbox, repair_tools
+from tauceti_queue import diagnostics, repair_sandbox, repair_tools
 
 DEFAULT_REPOSITORY = "TauCetiProject/TauCeti"
 CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
@@ -90,6 +91,11 @@ def module_to_path(module: str) -> str:
     return module.replace(".", "/") + ".lean"
 
 
+# Task kinds whose agent finishes a replay of the chain onto ``onto``: the head's rebase onto `main`, and
+# the next open batch's pre-rebase onto the head's tip (the next head's expected base).
+REBASE_KINDS = ("rebase_conflict", "pre_rebase")
+
+
 def empty_findings() -> dict:
     """The diagnostics structure the prompt consumes; every producer fills a copy of this."""
     return {
@@ -115,6 +121,9 @@ def normalise_findings(raw: dict | None) -> dict:
     lint = raw.get("lint")
     if isinstance(lint, dict):
         findings["lint"] = {"findings": list(lint.get("findings") or []), "report": list(lint.get("report") or [])}
+    for key in ("admission_predictions",):
+        if isinstance(raw.get(key), dict):
+            findings[key] = raw[key]
     for key in ("built_modules", "canceled_jobs"):
         value = raw.get(key)
         if isinstance(value, int):
@@ -143,8 +152,11 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
     onto, pending, clean_prefix_tip, landed_on_base}`` entry (``landed_on_base`` lists the members the
     target already carries, ``{source_pr, commit}`` each). Compiler findings become ``compiler_errors`` (with the
     line and column parsed from the message when it starts with ``path:line:col``), lint findings keep
-    their module and message, every other kind is kept under ``other``, and the conflict entry under
-    ``conflict``. A dict is taken as an already structured findings record.
+    their module and message, every other kind is kept under ``other``, the conflict entry under
+    ``conflict``, and a pre-rebase's ``{kind: "cross_batch", removed_used, added_by_both}`` entry (the
+    predicted ripples from the head, ``repair_context.cross_batch``) under ``cross_batch``, and its
+    ``{kind: "prepare_errors", task_id, errors}`` entry (the errors the batch's preparation left) under
+    ``prepare_errors``. A dict is taken as an already structured findings record.
     """
     if isinstance(entries, dict):
         findings = normalise_findings(entries)
@@ -158,6 +170,15 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
         if not isinstance(raw, dict):
             continue
         kind = str(raw.get("kind") or "")
+        if kind == "admission_predictions":
+            findings["admission_predictions"] = raw
+            continue
+        if kind == "cross_batch":
+            findings["cross_batch"] = raw
+            continue
+        if kind == "prepare_errors":
+            findings["prepare_errors"] = raw
+            continue
         module = str(raw.get("module") or raw.get("path") or "")
         message = str(raw.get("message") or "")
         if kind == "conflict":
@@ -193,9 +214,29 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
             if module and module not in findings["failed_modules"]:
                 findings["failed_modules"].append(module)
         elif family == "lint":
-            findings["lint"]["findings"].append(
-                {"linter": raw.get("linter") or kind, "declaration": raw.get("declaration") or message, "path": module}
-            )
+            entry = {
+                "linter": raw.get("linter") or kind,
+                "declaration": raw.get("declaration") or message,
+                "path": module,
+            }
+            if raw.get("path"):
+                entry["path"] = str(raw["path"])
+            if entry not in findings["lint"]["findings"]:
+                findings["lint"]["findings"].append(entry)
+        elif family == "audit" and (duplicate := diagnostics.DUPLICATE.fullmatch(message.strip())):
+            # CI's (and the worker's) audit names both owners on one line; one entry naming both modules.
+            declaration, modules = duplicate.group(1), [duplicate.group(2), duplicate.group(3)]
+            entry = {"declaration": declaration, "modules": [m for m in modules if m.startswith("TauCeti.")]}
+            if entry["modules"] and entry not in findings["duplicate_declarations"]:
+                findings["duplicate_declarations"].append(entry)
+        elif family == "audit" and (collision := diagnostics.AUDIT.fullmatch(message.strip())):
+            entry = {
+                "module": collision.group(1),
+                "declaration": collision.group(2),
+                "other_module": collision.group(3),
+            }
+            if entry not in findings["import_collisions"]:
+                findings["import_collisions"].append(entry)
         else:
             findings["other"].append({"kind": kind or "finding", "module": module, "message": message})
     return findings
@@ -820,6 +861,7 @@ def prepare_artifacts(
     mathlib_cache: bool = False,
     lake: tuple[str, ...] = ("lake",),
     preferred: tuple[tuple[str, str], ...] = (),
+    warm: tuple[tuple[str, str], ...] = (),
     build: bool = True,
 ) -> dict:
     """Warm artifacts the way the plan's default source does: main's cache at the base, then an
@@ -841,9 +883,13 @@ def prepare_artifacts(
     probes whether the failed candidate's own outputs were published (measurement only).
     ``preferred`` are ``(service, revision)`` fetches tried before all of these (the workers' repair
     namespace, ``repair_publish.preferred``); ``cache_service`` records the service of the restored
-    mapping. ``build=False`` fetches only: the caller runs the
-    incremental build itself (``repair_stream`` streams it to the agent), so ``available`` rests on the
-    fetch alone.
+    mapping. ``warm`` are ``(service, revision)`` fetches that all run before those, each that has a
+    mapping restoring its outputs (``warm_attempts`` records every one, ``warmed_from`` the revisions
+    that had a mapping, in order); Lake keys the outputs by input trace, so the fetches add to one
+    another and a later one never displaces an artifact for a different input. A warm hit makes the
+    artifacts available even when no other revision is published (``cache_revision`` is then the
+    first warmed revision). ``build=False`` fetches only, so ``available`` rests on the fetch alone:
+    streaming callers build afterwards, and rebase tasks build the resulting chain after replay.
     """
     record: dict = {}
     seconds = 0.0
@@ -854,8 +900,22 @@ def prepare_artifacts(
         seconds += deps["seconds"]
         if deps["rc"] != 0:
             reasons.append(f"lake exe cache get exited {deps['rc']}")
+    warm_attempts: list[dict] = []
+    for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
+        fetch = _fetch_mapping(
+            worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False, service=service
+        )
+        fetch["distance"] = None
+        warm_attempts.append(fetch)
+        seconds += fetch["seconds"]
+    warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
+    record["warm_attempts"] = warm_attempts
+    record["warmed_from"] = [fetch["revision"] for fetch in warmed]
+    tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
     attempts: list[dict] = []
-    candidates = [(service, revision, None) for service, revision in preferred if revision] + [
+    candidates = [
+        (service, revision, None) for service, revision in preferred if revision and (service, revision) not in tried
+    ] + [
         (CACHE_SERVICE, revision, distance)
         for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
     ]
@@ -870,6 +930,8 @@ def prepare_artifacts(
             break
     found = attempts[-1] if attempts[-1]["mapping_found"] else None
     record["base_cache"] = attempts[-1]
+    if found is None and warmed:
+        found = warmed[0]
     record["cache_attempts"] = attempts
     record["cache_revision"] = found["revision"] if found else None
     record["cache_distance"] = found["distance"] if found else None
@@ -932,13 +994,13 @@ class PromptContext:
 
     repository: str
     base: str  # the base the result must be on (for a rebase conflict: the target base)
-    kind: str = "repair"  # repair | rebase_conflict
+    kind: str = "repair"  # repair | rebase_conflict | pre_rebase | prepare
     origin: str = ""  # one sentence: where this batch came from and why it is here
     suspects: list[int] = dataclasses.field(default_factory=list)
     suspect_heads: dict[int, str] = dataclasses.field(default_factory=dict)
     named_modules: list[str] = dataclasses.field(default_factory=list)
     conflict: dict | None = (
-        None  # rebase_conflict: {member, paths, onto, previous_base, pending, clean_prefix_tip, landed_on_base}
+        None  # rebase_conflict, pre_rebase: {member, paths, onto, previous_base, pending, clean_prefix_tip, landed_on_base}
     )
     feedback: str | None = None  # a validation report from a rejected attempt
     members: list[dict] = dataclasses.field(
@@ -951,6 +1013,8 @@ class PromptContext:
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
     rebase_options: str = "--keep-empty --empty=keep --reapply-cherry-picks"  # the replay's git options
     repair_context: object | None = None  # ``repair_context.compute``'s result: ownership, collisions and ripples
+    pre_rebased: bool = False  # prepare: the chain is the batch's pre-rebase on the head's tip ``base``
+    scope_failure_only: bool = False  # compilation passed; only the trusted scope-policy verdict failed
 
 
 def _pr_list(prs: list[int]) -> str:
@@ -995,7 +1059,7 @@ def _members_by_number(context: PromptContext) -> dict[int, dict]:
 
 def conflict_position(context: PromptContext, chain: list[ChainCommit]) -> int | None:
     """The chain index of the conflicting member of a rebase conflict, None when there is none."""
-    conflict = context.conflict if context.kind == "rebase_conflict" else None
+    conflict = context.conflict if context.kind in REBASE_KINDS else None
     member = (conflict or {}).get("member")
     if not member or "#" not in str(member):
         return None
@@ -1014,7 +1078,7 @@ def landed_on_main(context: PromptContext, chain: list[ChainCommit], clone: Path
     the target whose subject ends in ``(#N)`` for a member's PR number. Empty for a repair, whose base
     is the target."""
     conflict = context.conflict or {}
-    previous = conflict.get("previous_base") if context.kind == "rebase_conflict" else None
+    previous = conflict.get("previous_base") if context.kind in REBASE_KINDS else None
     numbers = {c.pr for c in chain if c.pr is not None}
     landed: dict[int, str | None] = {}
     flagged = False
@@ -1071,6 +1135,8 @@ def member_records(
             "provenance": (member or {}).get("provenance"),
             "landed_on_main": (landed.get(commit.pr) or "landed") if commit.pr in landed else None,
         }
+        if (member or {}).get("no_repair"):
+            record["no_repair"] = True
         if stop is not None:
             record["state"] = (
                 MEMBER_STATES[0] if index < stop else MEMBER_STATES[1] if index == stop else MEMBER_STATES[2]
@@ -1212,7 +1278,7 @@ def write_listings(
     check.write_text(check_script(context.base, context.repository))
     check.chmod(0o755)
     repair_tools.write_build_script(directory)
-    if context.kind == "rebase_conflict" and (context.conflict or {}).get("previous_base"):
+    if context.kind in REBASE_KINDS and (context.conflict or {}).get("previous_base"):
         step = directory / STEP_FILE
         step.write_text(step_script(context.base, str(context.conflict["previous_base"]), context.rebase_options))
         step.chmod(0o755)
@@ -1298,10 +1364,26 @@ def _hours_text(seconds: int) -> str:
     return f"{seconds}-second"
 
 
+# What every task's prompt says about the build cache: the worker has fetched it, the agent never does.
+CACHE_SENTENCE = (
+    "The worker has already placed in `.lake` every build artifact it could find (the repair cache's outputs for "
+    "this batch and the revisions near it, then the public cache); do not run `lake exe cache get`, "
+    "`lake cache get` or any other cache fetch yourself. When the task replays a batch onto a queue head, the "
+    "public cache has nothing for the target commit, which is not on `main` yet: that miss is expected and is not "
+    "a reason to stop. Proceed to build incrementally."
+)
+
+# The one sentence the prompt says about the worker's checks (``repair_audit``): a fact, not a request.
+AUDIT_SENTENCE = (
+    f"`{LISTINGS_DIR}/{BUILD_FILE}` with no module arguments and the worker's verification also run CI's audits and "
+    "lints; the task cannot be submitted until they pass."
+)
+
+
 def _verification_section(
     context: PromptContext, findings: dict, base_short: str, check_command: str | None
 ) -> list[str]:
-    conflict = context.conflict if context.kind == "rebase_conflict" else None
+    conflict = context.conflict if context.kind in REBASE_KINDS else None
     lines = ["", "## Verifying locally", ""]
     if check_command:
         lines += [
@@ -1317,6 +1399,8 @@ def _verification_section(
             f"Check a fix with `{LISTINGS_DIR}/{BUILD_FILE} <Module.Name>` first (add `--dependents` to include the "
             "modules that import it): it builds only those modules and waits for any other build in this checkout "
             "to finish. Run the whole-library `lake build --iofail` only as the final verdict.",
+            "",
+            AUDIT_SENTENCE,
         ]
         if check_command
         else []
@@ -1347,8 +1431,17 @@ def _verification_section(
             + " Judge each by its exit status; the queue's CI builds the whole library once you return. Run a full "
             "`lake build --iofail` only after the rebase is finished and only if time allows. "
             + foreground
-            + " Do not run `lake exe cache get` or `lake cache get` (the worker already tried); do not use "
-            "`--fail-fast`.",
+            + " "
+            + CACHE_SENTENCE
+            + " Do not use `--fail-fast`.",
+            *scoped,
+        ]
+    elif context.kind in REBASE_KINDS:
+        lines += [
+            "Artifacts are warm: the worker fetched the available cache outputs into `.lake` without building "
+            "the original chain. Finish the rebase first, then build the resulting chain with "
+            "`lake build --iofail` and judge it by its exit status; cached outputs are reused when their inputs "
+            "still match. " + foreground + " " + CACHE_SENTENCE + " Do not use `--fail-fast`.",
             *scoped,
         ]
     else:
@@ -1357,7 +1450,9 @@ def _verification_section(
             "`lake build --iofail` (whole library, incremental, as CI runs it) rebuilds only the failing modules and their "
             "dependents. Run it and judge it by its exit status. "
             + foreground
-            + " Do not run `lake exe cache get` or `lake cache get`; do not use `--fail-fast`.",
+            + " "
+            + CACHE_SENTENCE
+            + " Do not use `--fail-fast`.",
             *scoped,
         ]
     lines += [
@@ -1400,12 +1495,22 @@ def _rebase_sections(
         cleanly = " It is the first commit of the batch, so nothing replayed before it."
     else:
         cleanly = f" The commits before it replayed cleanly and are at commit `{prefix}`." if prefix else ""
+    pre = context.kind == "pre_rebase"
+    target = (
+        f"the tip `{base_short}` of the head batch ahead of it" if pre else f"the current `main` commit `{base_short}`"
+    )
     happened = [
         "## What happened",
         "",
         f"The queue replayed this batch of {len(chain)} squash commits, one per pull request, from its base `{previous}` "
-        f"onto the current `main` commit `{base_short}` with git. The replay stopped at {commit_text}{in_paths}.{cleanly} "
+        f"onto {target} with git. The replay stopped at {commit_text}{in_paths}.{cleanly} "
         f"Your job is to finish that replay so the whole batch sits on `{base_short}`."
+        + (
+            f" The target is not `main`: `{base_short}` is what `main` becomes when the head lands, so this is the next "
+            "head's expected base, and the head's CI round may still change it."
+            if pre
+            else ""
+        )
         + (f" {context.origin}" if context.origin else ""),
         "",
         f"You are in a private, detached Git worktree of {context.repository}; HEAD is the batch's tip on `{previous}`, "
@@ -1416,7 +1521,7 @@ def _rebase_sections(
         "## Conflict evidence",
         "",
         f"- base, the batch's previous base: `{previous}`",
-        f"- target, the current `main`: `{base_short}`",
+        f"- target, the head's tip: `{base_short}`" if pre else f"- target, the current `main`: `{base_short}`",
     ]
     if stop is not None:
         title = member_records(context, chain)[stop]["title"]
@@ -1477,6 +1582,39 @@ def _landed_section(
     return lines
 
 
+def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list[str]:
+    """The "Do not edit" section: members whose authors opted out of repair (``no_repair``), and those
+    the queue already withdrew that way (``withdrawn``), which stay empty commits."""
+    by_number = _members_by_number(context)
+    titles = {c.pr: c.subject for c in chain if c.pr is not None}
+    guarded = [n for n, m in by_number.items() if m.get("no_repair") and n in titles]
+    if not guarded:
+        return []
+    lines = [
+        "## Do not edit",
+        "",
+        "The authors of these PRs opted out of repair (`dont-repair-in-queue`). Do not change their content or their messages:",
+        "",
+    ]
+    for number in guarded:
+        state = " (withdrawn: keep it an empty commit)" if by_number[number].get("withdrawn") else ""
+        lines.append(f"- #{number} {by_number[number].get('title') or titles[number]}{state}")
+    lines += [
+        "",
+        "If making the batch build needs a change to one of them, do not make it: reduce that member to an empty "
+        "commit instead (its content removed, its message kept) and append to its message, as its explanation, which "
+        "other PR, file and finding made the change necessary, one per line:",
+        "",
+        "    Interacting-PR: #<the other PR>",
+        "    Interacting-File: <path of the file>",
+        "    Finding: <conflict, duplicate declaration, rename ripple or build error>: <one sentence>",
+        "",
+        "The queue withdraws such a PR and tells its author; repair the rest of the batch as usual, without it.",
+        "",
+    ]
+    return lines
+
+
 def _result_section(base_short: str) -> list[str]:
     return [
         "",
@@ -1498,7 +1636,7 @@ def _autosquash(base_short: str) -> str:
 
 
 def _editing_section(context: PromptContext, chain: list[ChainCommit], base_short: str, where: str | None) -> list[str]:
-    conflict = context.conflict if context.kind == "rebase_conflict" else None
+    conflict = context.conflict if context.kind in REBASE_KINDS else None
     if conflict:
         previous = (conflict.get("previous_base") or (chain[0].parent if chain else "") or "")[:12]
         stop = conflict_position(context, chain)
@@ -1554,13 +1692,82 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     """
     base_short = context.base[:12]
     lines = [context.instruction or AGENT_INSTRUCTION, ""]
-    conflict = context.conflict if context.kind == "rebase_conflict" else None
+    conflict = context.conflict if context.kind in REBASE_KINDS else None
     landed = landed_on_main(context, chain, clone)
     where = write_listings(context, chain, landed) if context.listings_path is not None else None
+    knowledge = findings.get("admission_predictions")
+    if knowledge and context.listings_path is not None:
+        (context.listings_path.parent / "admission.json").write_text(json.dumps(knowledge, indent=2) + "\n")
     check_command = f"python3 {LISTINGS_DIR}/{CHECK_FILE}" if where else None
     if conflict:
         happened, evidence = _rebase_sections(context, chain, clone, base_short, where)
         lines += happened + evidence
+    elif knowledge and knowledge.get("proactive"):
+        lines += [
+            "## What happened",
+            "",
+            f"This batch of {len(chain)} attributed PR commits is on `{base_short}`. Its first CI attempt is still "
+            "being validated. Compiled accepted-input records predict an interaction worth checking now; no failed "
+            "CI verdict is implied. Resolve real problems found by the worker's scripted build and audits. If those "
+            "checks pass and no edit is needed, leave the chain unchanged; the controller keeps its existing CI.",
+            "",
+            "## Admission and build evidence",
+            "",
+        ]
+    elif context.scope_failure_only:
+        lines += [
+            "## What happened",
+            "",
+            f"This batch of {len(chain)} attributed PR commits on `{base_short}` passed compilation, but its "
+            "scope-policy verdict failed. This is not a failed Lean build. Inspect the recorded policy finding; "
+            "the necessary correction may be in trusted tooling outside this candidate. If no source edit is "
+            "needed, leave the valid chain clean and unchanged. The worker may submit that same tip for fresh "
+            "normal CI; no check is waived. Do not manufacture an edit or remove human-owned contributions.",
+            "",
+            "## CI policy evidence",
+            "",
+        ]
+    elif context.kind == "prepare" and context.pre_rebased:
+        lines += [
+            "## What happened",
+            "",
+            f"This batch of {len(chain)} squash commits, one per pull request, is waiting behind the queue's head and "
+            f"has been replayed onto the head's tip `{base_short}`, the commit it becomes the next head on when the "
+            "head lands as it is. Fix what fails to build on that tip so the batch is ready when it becomes the head; "
+            "nothing you do is a verdict. The head's CI round decides later, and your edits travel with the members."
+            + (f" {context.origin}" if context.origin else "")
+            + f" Your job is to make the whole batch build on `{base_short}`; the head's own commits below it are not "
+            "yours to edit.",
+            "",
+            f"You are in a private, detached Git worktree of {context.repository}; HEAD is the batch's pre-rebased tip "
+            f"on `{base_short}`.",
+            "",
+            "## Build evidence",
+            "",
+            "No CI run has seen this chain. The worker's own whole-library `lake build --iofail` of it reports the "
+            "errors; see the build section below.",
+            "",
+        ]
+    elif context.kind == "prepare":
+        lines += [
+            "## What happened",
+            "",
+            f"This batch of {len(chain)} squash commits, one per pull request, is waiting behind the queue's head on "
+            f"the `main` commit `{base_short}`. This batch has not yet been tried; fix what fails to build so it is "
+            "ready when it becomes the head; nothing you do is a verdict. The head's CI round decides later, after "
+            "the batch is rebased onto the `main` of that time, and your edits travel with its members."
+            + (f" {context.origin}" if context.origin else "")
+            + f" Your job is to make the whole batch build on `{base_short}`.",
+            "",
+            f"You are in a private, detached Git worktree of {context.repository}; HEAD is the batch's tip on "
+            f"`{base_short}`.",
+            "",
+            "## Build evidence",
+            "",
+            "No CI run has seen this batch. The worker's own whole-library `lake build --iofail` of it reports the "
+            "errors; see the build section below.",
+            "",
+        ]
     else:
         lines += [
             "## What happened",
@@ -1669,12 +1876,49 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     if where is None:
         lines += _inline_listing(context, chain, landed)
     lines += _landed_section(context, chain, landed, where)
+    lines += _no_repair_section(context, chain)
     if context.repair_context is not None and where:
         lines += context.repair_context.prompt_lines()
+    if context.kind == "pre_rebase":
+        from tauceti_queue.repair_context import cross_batch_lines  # repair_context imports this module
+
+        lines += cross_batch_lines(findings.get("cross_batch"))
+        lines += prepare_errors_lines(findings.get("prepare_errors"))
+    from .admission_planning import prompt_lines
+
+    lines += prompt_lines(knowledge, with_file=context.listings_path is not None)
     lines += _result_section(base_short)
     lines += _editing_section(context, chain, base_short, where)
     lines += _verification_section(context, findings, base_short, check_command)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+
+
+PREPARE_ERRORS_SHOWN = 20
+
+
+def prepare_errors_lines(record: dict | None) -> list[str]:
+    """The prompt's section for a pre-rebase of a prepared batch: the errors its preparation's build
+    reported that no later worker build showed fixed; empty when there were none."""
+    errors = [e for e in (record or {}).get("errors") or [] if isinstance(e, dict)]
+    if not errors:
+        return []
+    lines = [
+        "",
+        "## Errors the batch's preparation left",
+        "",
+        f"Before this task the batch was built and repaired on its own base (prepare task {record.get('task_id')}). "
+        "Its build reported these errors, which no later worker build showed fixed. Check them once the chain is on "
+        "the head's tip and fix those that remain in the member that owns the file:",
+        "",
+    ]
+    for error in errors[:PREPARE_ERRORS_SHOWN]:
+        where = f"{error.get('path') or error.get('file') or '?'}:{error.get('line', 0)}:{error.get('column', 0)}"
+        message = str(error.get("message") or "").strip().splitlines()
+        lines.append(f"- `{where}`" + (f": {message[0]}" if message else ""))
+    omitted = len(errors) - PREPARE_ERRORS_SHOWN + int(record.get("omitted") or 0)
+    if omitted > 0:
+        lines.append(f"- and {omitted} more in the task's `prepare_errors` diagnostics")
+    return lines
 
 
 def explanation_prompt(unexplained: list[str], chain: list[ChainCommit]) -> str:
@@ -1757,6 +2001,24 @@ def prepare_codex_home(root: Path) -> Path:
     return iso
 
 
+def prepare_claude_shell_env(config: Path) -> Path:
+    """Keep unattended Bash stdin at EOF, including commands with heredocs.
+
+    Claude's native guard misses compound commands: anthropics/claude-code#84424.
+    The CLI re-reads this file after cwd changes, so keep it in persistent config,
+    and replace atomically because parallel repair agents share that config.
+    """
+    path = config.resolve() / "bash-env.sh"
+    fd, name = tempfile.mkstemp(prefix=".bash-env-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write("exec </dev/null\n")
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+    return path
+
+
 def isolation_env(
     root: Path, env_lake: dict | None = None, provider: str = "claude", *, api_key: str | None = None
 ) -> dict:
@@ -1782,6 +2044,10 @@ def isolation_env(
             changes["CODEX_HOME"] = str(prepare_codex_home(root))
         else:
             changes["CLAUDE_CONFIG_DIR"] = str(prepare_claude_config(root))
+    if provider != "codex":
+        # The host launcher supplies this through --settings, above project/user
+        # settings and inherited CLAUDE_ENV_FILE; this private queue config owns it.
+        changes["TAUCETI_REPAIR_CLAUDE_ENV_FILE"] = str(prepare_claude_shell_env(Path(changes["CLAUDE_CONFIG_DIR"])))
     changes["GH_TOKEN"] = None
     changes["GITHUB_TOKEN"] = None
     empty_gh = root / "gh-config-empty"
@@ -1803,13 +2069,10 @@ def agent_environment(
     None because the prompt is in argv."""
     os.environ["TAUCETI_ROUND_DEADLINE"] = str(time.time() + deadline_seconds)
     from tauceti_worker.agents import host_agent_launch
+    from tauceti_worker.repair_recovery import environment
 
-    argv, env, stdin_text = host_agent_launch(prompt, claude_profile())
-    for key, value in isolation_env(root, env_lake).items():
-        if value is None:
-            env.pop(key, None)
-        else:
-            env[key] = value
+    with environment(**isolation_env(root, env_lake)):
+        argv, env, stdin_text = host_agent_launch(prompt, claude_profile())
     return argv, env, stdin_text
 
 

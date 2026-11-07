@@ -97,6 +97,12 @@ class Config:
     public_url: str = "https://queue.taucetiproject.org"
     reconcile_interval_seconds: int = 30
     review_app_id: int = 3947238  # the App whose `merge eligibility` checks and exact-head comments approve
+    admission_source: str = "policy"  # eligibility is only for an explicit pre-cutover deployment
+    admission_rubrics: str = (
+        "correctness,reuse,scope,attribution,api-design,generality,placement,naming,documentation,proof-quality"
+    )
+    admission_lean_root: str = "TauCeti"
+    admission_extra_files: str = ""
     settings: Settings = field(default_factory=Settings)
     # Bookkeeping, not configuration: where the file came from and the source of every value.
     path: Path | None = None
@@ -255,6 +261,16 @@ def validate(config: Config) -> list[str]:
         problems.append("reconcile_interval_seconds must be at least 1")
     if config.review_app_id < 1:
         problems.append("review_app_id must be a positive GitHub App id")
+    if config.admission_source not in ("eligibility", "policy"):
+        problems.append("admission_source must be eligibility or policy")
+    if not config.admission_rubrics or any(
+        not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", s) for s in config.admission_rubrics.split(",")
+    ):
+        problems.append("admission_rubrics must be a comma-separated list of rubric names")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*", config.admission_lean_root):
+        problems.append("admission_lean_root must be a Lean module name")
+    if any(s.startswith(("/", "-")) or ".." in Path(s).parts for s in config.admission_extra_files.split(",") if s):
+        problems.append("admission_extra_files must contain relative repository paths")
     for name in SETTING_FIELDS:
         if getattr(config.settings, name) < 1:
             problems.append(f"{name} must be at least 1")
@@ -307,15 +323,45 @@ def discover_canonical_branch(config: Config, timeout: float = 30) -> str:
     raise ConfigError(f"{config.repository} reports no symbolic HEAD; set canonical_branch explicitly")
 
 
-def format_effective(config: Config, problems: list[str]) -> str:
-    """The one-screen rendering of `check-config`."""
+def runtime_settings(config: Config) -> dict[str, Any]:
+    """The runtime controls the file seeds into the store: `[settings]` and `publication_enabled`."""
+    return {**config.settings.as_dict(), "publication_enabled": config.publication_enabled}
+
+
+def effective_runtime_settings(config: Config, stored: dict[str, dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    """Each runtime control's effective value and where it comes from: the store's value (with the
+    actor that wrote it) once the store holds one, otherwise the file's (or default) value."""
+    effective: dict[str, dict[str, Any]] = {}
+    for name, value in runtime_settings(config).items():
+        record = (stored or {}).get(name)
+        if record is None:
+            effective[name] = {"value": value, "source": config.sources.get(name, "default")}
+        else:
+            effective[name] = {
+                "value": record["value"],
+                "source": "store",
+                "actor": record.get("actor") or "",
+                "file_value": value,
+            }
+    return effective
+
+
+def format_effective(config: Config, problems: list[str], stored: dict[str, dict[str, Any]] | None = None) -> str:
+    """The one-screen rendering of `check-config`; `stored` is the store's settings rows, if any."""
     lines = [f"configuration file: {config.path or '(none; defaults and environment only)'}"]
     width = max(len(name) for name in (*_FIELDS, *SETTING_FIELDS)) + 2
     for name in _FIELDS:
         lines.append(f"  {name:<{width}}{getattr(config, name)!s:<48} [{config.sources[name]}]")
-    lines.append("  settings (initial values; the store's persisted settings win once it exists):")
-    for name in SETTING_FIELDS:
-        lines.append(f"    {name:<{width - 2}}{getattr(config.settings, name)!s:<48} [{config.sources[name]}]")
+    if stored is None:
+        lines.append("  runtime settings (no store yet; `serve` seeds it with these values):")
+    else:
+        lines.append("  runtime settings (the store's value wins; the file only seeds keys the store lacks):")
+    for name, entry in effective_runtime_settings(config, stored).items():
+        if entry["source"] == "store":
+            origin = f"store, set by {entry['actor'] or 'unknown'}; file {entry['file_value']!s}"
+        else:
+            origin = entry["source"]
+        lines.append(f"    {name:<{width - 2}}{entry['value']!s:<48} [{origin}]")
     lines.append(f"  {'listen_url':<{width}}{config.listen_url}")
     lines.append(f"  {'webhook_url':<{width}}{config.webhook_url}")
     lines.append(f"  {'mode':<{width}}{config.mode}")

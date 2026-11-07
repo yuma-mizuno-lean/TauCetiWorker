@@ -13,7 +13,7 @@ PR moved to another head, was closed or became a draft is told the way the webho
 (`controller.handle_event` with the equivalent `pull_request` action); a member PR is journaled and
 left alone, as the webhook path does. A decision the controller already consumed is not applied
 again: an input cancelled at the same head (withdrawn by `bors r-`, conflicting with the canonical
-branch, landed by other means) stays cancelled until a newer check (a higher id) decides again, as
+branch, landed by other means, withdrawn as `problem-anticipated`) stays cancelled until a newer check (a higher id) decides again, as
 it would under the webhook path, which only acts on new deliveries.
 
 Budget: one listing (GraphQL, ~12 calls for 1,200 open PRs) plus, per difference found, the calls
@@ -262,7 +262,13 @@ def _consumed(row: dict[str, Any], decision: eligibility.Decision) -> bool:
         evidence = {}
     if evidence.get("kind") == "eligibility_check" and isinstance(evidence.get("comment_id"), int):
         return evidence["comment_id"] >= decision.check_id
-    return row.get("reason") in ("unapproved", "cancelled", "conflicts-with-main", "landed-externally")
+    return row.get("reason") in (
+        "unapproved",
+        "cancelled",
+        "conflicts-with-main",
+        "landed-externally",
+        "problem-anticipated",
+    )
 
 
 class ApprovalPollLoop:
@@ -274,6 +280,10 @@ class ApprovalPollLoop:
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
         self._thread: threading.Thread | None = None
+        if hasattr(poller, "wake"):
+            poller.wake = self.wake
+        if hasattr(poller, "stopping"):
+            poller.stopping = self.stop_event
 
     def interval(self) -> float:
         interval = self.poller.interval()
@@ -284,12 +294,12 @@ class ApprovalPollLoop:
     def run(self) -> None:
         reason = "start"
         while not self.stop_event.is_set():
+            self.wake_event.clear()
             try:
                 self.poller.run_once(reason=reason)
             except Exception:  # noqa: BLE001 - the loop must survive any adapter failure
                 log.exception("approval poll failed")
             woken = self.wake_event.wait(timeout=self.interval())
-            self.wake_event.clear()
             reason = "wake" if woken else "interval"
 
     def wake(self) -> None:

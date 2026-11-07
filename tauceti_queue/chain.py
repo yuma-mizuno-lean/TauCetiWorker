@@ -298,22 +298,30 @@ def landed_prs(repo: str | os.PathLike[str], since: str, until: str) -> dict[str
     A queue commit names its PR in the Source-PR trailer (`owner/repo#N`); a Bors or GitHub squash
     commit carries no trailer and is known by its ` (#N)` subject suffix, recorded as `#N`. The
     newest commit naming a PR wins. Every commit in the range is scanned, not only the first-parent
-    line, so a squash commit reached through a merge counts.
+    line, so a squash commit reached through a merge counts. An empty single-parent commit lands
+    nothing and names no PR: it is how a member the queue withdrew (or emptied) reaches the branch,
+    and that PR must still be able to land later.
     """
     landed: dict[str, str] = {}
-    for record in git(repo, "log", "--format=%x1e%H%x1f%s%x1f%B", f"{since}..{until}").split("\x1e"):
+    records = []
+    trees: dict[str, str] = {}
+    for record in git(repo, "log", "--format=%x1e%H%x1f%T%x1f%P%x1f%s%x1f%B", f"{since}..{until}").split("\x1e"):
         if not record.strip():
             continue
-        sha, _, rest = record.partition("\x1f")
-        subject, _, body = rest.partition("\x1f")
+        sha, tree, parents, subject, body = record.split("\x1f", 4)
+        trees[sha.strip()] = tree
+        records.append((sha.strip(), tree, parents.split(), subject, body))
+    for sha, tree, parents, subject, body in records:
+        if len(parents) == 1 and tree == (trees.get(parents[0]) or tree_of(repo, parents[0])):
+            continue
         sources = set(trailer_values(body, SOURCE_PR_TRAILER))
         if sources:
             for source in sources:
-                landed.setdefault(source, sha.strip())
+                landed.setdefault(source, sha)
             continue
         match = _SUBJECT_PR_RE.search(subject)
         if match:
-            landed.setdefault(f"#{match['number']}", sha.strip())
+            landed.setdefault(f"#{match['number']}", sha)
     return landed
 
 
@@ -323,6 +331,11 @@ def landed_commit(landed: dict[str, str], source_pr: str) -> str | None:
     if sha is None and "#" in source_pr:
         sha = landed.get("#" + source_pr.rsplit("#", 1)[1])
     return sha
+
+
+def carries_landed_note(message: str) -> bool:
+    """Whether the message carries the landing note `landed_message` appends."""
+    return bool(_LANDED_NOTE_RE.search(message))
 
 
 def landed_message(message: str, sha: str) -> str:

@@ -7,8 +7,8 @@ runs one agent per group concurrently, up to ``RunnerConfig.parallel_agents``. E
 own detached worktree of the chain tip (added from the task's worktree, sharing the extracted
 ``.lake/packages`` by symlink) with a prompt scoped to its group, and leaves ``fixup!`` and ``squash!``
 commits for the owning members on top of the tip instead of rewriting the chain. The worker then
-cherry-picks every group's commits onto the tip in the task's worktree, folds them with one autosquash
-rebase, validates the chain with the usual checks and runs the single whole-library
+cherry-picks every group's commits onto the tip as a reference, folds their deltas into the original
+members in the object store, validates the chain with the usual checks and runs the single whole-library
 ``lake build --iofail``. A group whose agent failed, whose commits were not the fixups asked for, or
 whose fixups do not apply is handed back to the sequential path in ``repair_task.run_task``, which runs
 the usual agent on the task's worktree with the remaining findings.
@@ -54,7 +54,8 @@ import types
 import typing
 from pathlib import Path
 
-from tauceti_queue import repair, repair_context, repair_sandbox, repair_stream, repair_tools
+from tauceti_queue import chain as chain_tool
+from tauceti_queue import repair, repair_audit, repair_context, repair_sandbox, repair_stream, repair_tools
 from tauceti_queue.repair import ChainCommit, PromptContext, git
 
 DEFAULT_PARALLEL_AGENTS = 3
@@ -66,6 +67,7 @@ IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][\w'.]*)", re.M)
 # Agent statuses that mean the provider, not the group, is the problem; with no group repaired they
 # release the task under the same name (``repair_task.RELEASED_AGENT_STATUSES``).
 PROVIDER_STATUSES = ("inference_unavailable", "artifacts_unavailable", "agent_launch_failed")
+CHECK_KINDS = ("audit", "lint")  # the worker's audit and lint findings in errors.jsonl (``repair_audit``)
 
 
 def parallel_agents_default() -> int:
@@ -205,6 +207,14 @@ def plan_groups(
     for prs in owners.values():
         for other in prs[1:]:
             unite(prs[0], other)
+    # One finding naming several modules (a duplicate declaration, an import collision) is one repair.
+    by_entry: dict[int, list[str]] = {}
+    for path, family, entry in items:
+        if family in ("duplicate_declarations", "import_collisions") and path:
+            by_entry.setdefault(id(entry), []).append(path)
+    for entry_paths in by_entry.values():
+        for path in entry_paths[1:]:
+            unite(owners[entry_paths[0]][0], owners[path][0])
     file_owner: dict[str, int] = {}
     for pr in members:
         for path in files[pr]:
@@ -239,7 +249,8 @@ def plan_groups(
 
 def read_errors(directory: Path) -> list[dict] | None:
     """The compiler errors of the streaming build's ``errors.jsonl`` in ``directory`` (the worktree's
-    ``.tauceti-repair``), without its event lines; None when there is no such file."""
+    ``.tauceti-repair``), with the audit and lint findings the worker appended (``kind`` ``audit`` or
+    ``lint``), without its event lines; None when there is no such file."""
     path = directory / repair_stream.ERRORS_FILE
     if not path.exists():
         return None
@@ -249,15 +260,27 @@ def read_errors(directory: Path) -> list[dict] | None:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(entry, dict) and entry.get("file") and not entry.get("event"):
+        if not isinstance(entry, dict) or entry.get("event"):
+            continue
+        if entry.get("file") or entry.get("kind") in CHECK_KINDS:
             errors.append(entry)
     return errors
 
 
 def merge_errors(findings: dict, errors: list[dict]) -> dict:
     """The task's findings with the streaming build's errors added as compiler errors (a location the
-    diagnostics already report is not repeated) and their modules as failed modules."""
+    diagnostics already report is not repeated) and their modules as failed modules, and its audit and
+    lint findings added as those diagnostics are (``repair.findings_from_diagnostics``)."""
     merged = json.loads(json.dumps(findings))
+    checks = repair.findings_from_diagnostics(
+        [{**e, "path": e.get("file") or ""} for e in errors if e.get("kind") in CHECK_KINDS]
+    )
+    for key in ("duplicate_declarations", "import_collisions"):
+        merged[key] += [entry for entry in checks[key] if entry not in merged[key]]
+    merged["lint"]["findings"] += [f for f in checks["lint"]["findings"] if f not in merged["lint"]["findings"]]
+    merged.setdefault("other", [])
+    merged["other"] += [f for f in checks["other"] if f not in merged["other"]]
+    errors = [e for e in errors if e.get("kind") not in CHECK_KINDS]
     located = {(e["path"], int(e.get("line") or 0), int(e.get("column") or 0)) for e in merged["compiler_errors"]}
     for error in errors:
         path = str(error["file"])
@@ -295,8 +318,9 @@ def group_prompt(context: PromptContext, group: Group, chain: list[ChainCommit],
         "",
         "## What happened",
         "",
-        f"The queue built this batch of {len(chain)} squash commits, one per pull request, on the `main` commit "
-        f"`{base_short}` with CI (`lake build --iofail`, as the staging build runs it) and the build failed. The "
+        f"The queue built this batch of {len(chain)} squash commits, one per pull request, on "
+        + ("the queue head's tip" if context.pre_rebased else "the `main` commit")
+        + f" `{base_short}` with CI (`lake build --iofail`, as the staging build runs it) and the build failed. The "
         "failures split into independent groups of modules; this run repairs one group while other runs repair the "
         "others at the same time, each in its own worktree. The worker folds every group's fixes into the chain and "
         "runs the whole-library build itself afterwards.",
@@ -545,20 +569,20 @@ def collect_fixups(group_worktree: Path, tip: str, group: Group) -> tuple[list[s
         match = FIXUP_SUBJECT.match(subject)
         if not match:
             return [], f"commit {sha[:12]} is not a fixup! or squash! commit ({subject[:60]})"
-        if match.group(1) == "fixup":
-            touched = set(git(group_worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split())
-            outside = sorted(touched - allowed)
-            if outside:
-                return [], f"fixup {sha[:12]} changes files outside the group: {', '.join(outside[:5])}"
+        touched = set(git(group_worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).splitlines())
+        outside = sorted(touched - allowed)
+        if outside:
+            return [], f"{match.group(1)} {sha[:12]} changes files outside the group: {', '.join(outside[:5])}"
     return shas, None
 
 
 def fold_fixups(worktree: Path, base: str, tip: str, groups: list[Group]) -> dict:
     """Cherry-pick every repaired group's commits onto the tip in the task's worktree and fold them
-    into the owning members with one autosquash rebase. A group whose commits do not apply is marked
-    ``fixups_not_applied`` and left for the sequential path; a rebase that fails leaves the worktree
-    at the tip with every group handed back."""
-    env = {**os.environ, "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": ":"}
+    into their original owners with object-store merges. Empty members and raw messages survive.
+    A group whose commits do not apply is left for the sequential path; a folding conflict or tree
+    mismatch leaves the worktree at the tip with every applied group handed back."""
+    original = chain_tool.chain_commits(worktree, base, tip)
+    updates: dict[str, list[tuple[str, chain_tool.ChainCommit]]] = {}
     git(worktree, "checkout", "--quiet", "--force", "--detach", tip)
     record: dict = {"cherry_picked": 0, "applied": [], "not_applied": []}
     for group in groups:
@@ -566,29 +590,73 @@ def fold_fixups(worktree: Path, base: str, tip: str, groups: list[Group]) -> dic
             continue
         before = git(worktree, "rev-parse", "HEAD").strip()
         try:
+            resolved = []
             for sha in group.fixups:
-                git(worktree, "cherry-pick", "--allow-empty", "--keep-redundant-commits", sha, env=env)
-        except RuntimeError as error:
+                fixup = chain_tool.read_commit(worktree, sha)
+                match = FIXUP_SUBJECT.fullmatch(fixup.message.partition("\n")[0])
+                if match is None or FIXUP_SUBJECT.match(match[2]) or len(fixup.parents) != 1:
+                    raise RuntimeError(f"invalid original-member fixup: {sha[:12]}")
+                target = match[2]
+                owners = [commit for commit in original if commit.message.partition("\n")[0] == target]
+                if not owners and re.fullmatch(r"[0-9a-fA-F]{4,40}", target):
+                    owners = [commit for commit in original if commit.sha.startswith(target.lower())]
+                if len(owners) != 1:
+                    raise RuntimeError(f"fixup target is unknown or ambiguous: {target}")
+                owner = owners[0]
+                if not owner.source_pr or int(owner.source_pr.rsplit("#", 1)[1]) not in group.members:
+                    raise RuntimeError(f"fixup target is outside the group's members: {target}")
+                touched = set(git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).splitlines())
+                if touched - set(group.files):
+                    raise RuntimeError(f"{match[1]} {sha[:12]} changes files outside the group")
+                resolved.append((owner.sha, match[1], fixup))
+            for sha in group.fixups:
+                git(worktree, "cherry-pick", "--allow-empty", "--keep-redundant-commits", sha)
+        except (RuntimeError, chain_tool.ChainError, ValueError) as error:
             git(worktree, "cherry-pick", "--abort", check=False)
             git(worktree, "reset", "--hard", "--quiet", before)
             group.status = "fixups_not_applied"
             group.detail = " ".join(str(error).split())[:300]
             record["not_applied"].append(group.name)
             continue
+        for owner, kind, fixup in resolved:
+            updates.setdefault(owner, []).append((kind, fixup))
         record["cherry_picked"] += len(group.fixups)
         record["applied"].append(group.name)
     if not record["applied"]:
         return record
     try:
-        git(worktree, "rebase", "-i", "--autosquash", "--keep-empty", "--empty=keep", base, env=env)
-    except RuntimeError as error:
-        git(worktree, "rebase", "--abort", check=False)
+        reference_tree = chain_tool.tree_of(worktree, "HEAD")
+        parent = base
+        for owner in original:
+            if len(owner.parents) != 1:
+                raise RuntimeError(f"original member {owner.sha[:12]} is not single-parent")
+            message = owner.message
+            merged = chain_tool.merge_trees(worktree, parent, owner.sha, merge_base=owner.parents[0])
+            if not merged.clean:
+                raise RuntimeError(f"replaying member {owner.sha[:12]} conflicts: {', '.join(merged.conflict_paths)}")
+            current = chain_tool.commit_tree(
+                worktree, merged.tree, parent, message, (owner.author_name, owner.author_email), owner.author_date
+            )
+            for kind, fixup in updates.get(owner.sha, []):
+                merged = chain_tool.merge_trees(worktree, current, fixup.sha, merge_base=fixup.parents[0])
+                if not merged.clean:
+                    raise RuntimeError(f"folding {fixup.sha[:12]} conflicts: {', '.join(merged.conflict_paths)}")
+                if kind == "squash" and (body := fixup.message.partition("\n")[2].strip("\n")):
+                    message = message.rstrip("\n") + "\n\n" + body + "\n"
+                current = chain_tool.commit_tree(
+                    worktree, merged.tree, parent, message, (owner.author_name, owner.author_email), owner.author_date
+                )
+            parent = current
+        if chain_tool.tree_of(worktree, parent) != reference_tree:
+            raise RuntimeError("the folded tree differs from the cherry-picked reference tree")
+        git(worktree, "checkout", "--quiet", "--force", "--detach", parent)
+    except (RuntimeError, chain_tool.ChainError) as error:
         git(worktree, "checkout", "--quiet", "--force", "--detach", tip)
-        record["rebase_error"] = " ".join(str(error).split())[:300]
+        record["fold_error"] = " ".join(str(error).split())[:300]
         for group in groups:
             if group.status == "repaired":
                 group.status = "fixups_not_applied"
-                group.detail = "the autosquash rebase failed: " + record["rebase_error"]
+                group.detail = "folding the member deltas failed: " + record["fold_error"]
         record["not_applied"] += record["applied"]
         record["applied"] = []
         return record
@@ -676,6 +744,7 @@ def repair_groups(
         if ownership is not None and hasattr(ownership, "members"):
             repair_context.write_files(ownership, path)
         repair_tools.write_build_script(path / repair_tools.TOOLS_DIR, lock=lock)
+        repair_audit.write_settings(path, base=base, tools_root=cfg.root / repair_audit.TOOLS_DIR, lake=tuple(cfg.lake))
         group.worktree = str(path)
         return path
 
@@ -777,6 +846,7 @@ def repair_groups(
     record["groups"] = [group.summary() for group in groups]
     folded_tip = record["fold"].get("tip")
     failed_modules: list[str] = []
+    check_findings: list[dict] = []
     if folded_tip:
         report = repair.chain_report(cfg.clone, base, tip, folded_tip, task.member_keys, prior_base=task.base)
         record["report"] = report
@@ -798,6 +868,20 @@ def repair_groups(
                     env_lake,
                     cfg.build_timeout,
                 )
+                if build["rc"] == 0 and getattr(cfg, "worker_audits", False) and task.kind == "repair":
+                    # CI's audits and changed-module lint over the green build, still under the lock.
+                    checks = repair_audit.check(
+                        worktree,
+                        env_lake,
+                        base=base,
+                        tools_root=cfg.root / repair_audit.TOOLS_DIR,
+                        logdir=logdir,
+                        lake=tuple(cfg.lake),
+                        timeout=cfg.build_timeout,
+                    )
+                    record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
+                    check_findings = checks["diagnostics"]
+                    repair_audit.append_errors(worktree / repair_tools.TOOLS_DIR, check_findings)
             build.update(repair.parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
             record["build"] = {k: v for k, v in build.items() if "load" not in k}
             failed_modules = list(build["failed_modules"])
@@ -806,12 +890,26 @@ def repair_groups(
     _cleanup(worktree, groups, cfg.keep_worktree)
     if cancel.is_set():
         record["status"] = "cancelled"
-    elif all(group.status == "folded" for group in groups) and not failed_modules and record.get("build"):
+    elif (
+        all(group.status == "folded" for group in groups)
+        and not failed_modules
+        and not check_findings
+        and record.get("build")
+    ):
         record["status"] = "ok"
         record["tip"] = folded_tip
+        if "checks" in record:
+            record["verified_tip"] = folded_tip  # built and checked: the sequential path need not repeat it
     else:
         record["status"] = "partial"
         record["remaining"] = remaining_findings(findings, groups, failed_modules)
+        if check_findings:
+            # The folded chain builds; what is left is the checks' findings, as the controller would report them.
+            remaining = repair.findings_from_diagnostics(check_findings)
+            for key in ("duplicate_declarations", "import_collisions", "other"):
+                record["remaining"].setdefault(key, [])
+                record["remaining"][key] += remaining[key]
+            record["remaining"]["lint"]["findings"] += remaining["lint"]["findings"]
     record["seconds"] = round(time.monotonic() - started, 1)
     return record
 

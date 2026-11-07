@@ -1436,32 +1436,37 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
             claude_model = _claude_review_model(reviewers)
             km = _kiro_review_model(reviewers)
-            rc = run_to_logfile(
-                [
-                    "uvx",
-                    "--from",
-                    f"git+https://github.com/{REVIEW}"
-                    + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
-                    "tauceti-review",
-                    str(pr),
-                    "--store",
-                    str(w.cfg.store_dir),
-                    "--post",
-                    "--no-sync",
-                    "--reviewer",
-                    reviewers,
-                    *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
-                    "--expect-head",
-                    head,
-                    "--submitted-by",
-                    me(),
-                    *(["--claude-model", claude_model] if claude_model else []),
-                    *(["--codex-model", cm] if cm else []),
-                    *(["--kiro-model", km] if km else []),
-                ],
-                logf,
-                f"review #{pr}",
-            )
+            from .retention import review_workspace
+
+            with review_workspace(w.cfg) as scratch:
+                rc = run_to_logfile(
+                    [
+                        "uvx",
+                        "--from",
+                        f"git+https://github.com/{REVIEW}"
+                        + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
+                        "tauceti-review",
+                        str(pr),
+                        "--workdir",
+                        str(scratch),
+                        "--store",
+                        str(w.cfg.store_dir),
+                        "--post",
+                        "--no-sync",
+                        "--reviewer",
+                        reviewers,
+                        *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
+                        "--expect-head",
+                        head,
+                        "--submitted-by",
+                        me(),
+                        *(["--claude-model", claude_model] if claude_model else []),
+                        *(["--codex-model", cm] if cm else []),
+                        *(["--kiro-model", km] if km else []),
+                    ],
+                    logf,
+                    f"review #{pr}",
+                )
         log(f"  review #{pr}: engine rc={rc}")
         from .claude_api import check_result
 
@@ -2404,6 +2409,10 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
         return {key: value.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs", "documentation")}
 
     for attempt in range(3):
+        # Checkout preparation and facts collection can take time. Observe
+        # reports that landed since the round's fetch before every plan.
+        if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
+            raise Die(f"progress: refreshing {roadmap_dir} before planning failed")
         output = attempts / str(attempt + 1)
         output.mkdir()
         plan_file, facts_file = output / "plan.json", output / "facts.json"
@@ -2416,6 +2425,8 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                     (
                         "--roadmap-dir",
                         str(roadmap_dir),
+                        "--roadmap-ref",
+                        "origin/main",
                         "--code-dir",
                         str(w.cfg.checkout),
                         "--min-prs",

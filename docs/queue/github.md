@@ -53,13 +53,14 @@ are unix seconds, run and comment ids strings, `repo` is `owner/name`, SHAs are 
 | --- | --- |
 | `fetch_pr(repo, number) -> PullRequest` | `GET /repos/{repo}/pulls/{n}`; the port's record plus `base_sha`, `author_id`, `head_repo`, `merged`; raises `PullRequestNotFound` (a `LookupError`) for an unknown number |
 | `fetch_refs(repo, refspecs)` | `git fetch` into the configured clone of `https://github.com/{repo}.git`; the installation token travels as an `http.extraheader` Authorization header through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`, so it is in neither argv, `.git/config`, nor any log |
-| `dispatch_candidate(repo, *, head_sha, base_sha, base_ref, batch_id, members) -> str` | `POST /repos/{repo}/dispatches` with `event_type: tauceti-bors-staging` and `client_payload {head_sha, base_sha, batch_id, members, base_ref}`, what Bors sends; `members` entries are `{pr, head_sha}` when given as mappings and `{pr}` for bare numbers (see findings); returns the run title `bors branch=<b> batch=<id> head=<sha> base=<sha>` as the dispatch id |
+| `dispatch_candidate(repo, *, head_sha, base_sha, base_ref, batch_id, members, repair_outputs_revs=()) -> str` | `POST /repos/{repo}/dispatches` with `event_type: tauceti-bors-staging` and `client_payload {head_sha, base_sha, batch_id, members, base_ref, repair_outputs_revs}`, what Bors sends plus `repair_outputs_revs` (the list of SHAs whose published outputs CI may restore, see controller.md); `members` entries are `{pr, head_sha}` when given as mappings and `{pr}` for bare numbers (see findings); returns the run title `bors branch=<b> batch=<id> head=<sha> base=<sha>` as the dispatch id |
 | `find_candidate_run(repo, *, batch_id, head_sha, base_sha, base_ref="main", since=None) -> CandidateRun \| None` | one list call `GET /actions/workflows/pr-build.yml/runs?event=repository_dispatch&created=<since-60s>..<now+60s>` matched on `display_title`, then the attempt's jobs; `phases` are the jobs and their steps as `CandidatePhase(name, started_at, completed_at, status, detail=conclusion)`; `runner_name`, `runner_labels` and `host` come from the `sandboxed-build` job; a completed unsuccessful run carries `diagnostics` (below); two runs with the same title raise `AmbiguousCandidateRun`, except that with `since` (the controller passes the attempt's dispatch time) the newest run created at or after it answers, because an infrastructure re-dispatch of the same head, base and batch legitimately creates a second run with the same title |
 | `commit_status(repo, sha, context) -> Status \| None` | the latest status for `context` from `GET /commits/{sha}/status`, with `run_id` parsed from `/actions/runs/<id>` in the target URL |
 | `fast_forward(repo, branch, expected_parent, tip) -> FastForwardResult(ok, actual_parent, error)` | reads `refs/heads/<branch>`; if it is not `expected_parent`, reports the actual parent without writing; else `PATCH /git/refs/heads/<branch>` with `force: false`; a 422 (non-fast-forward) re-reads the ref and reports it as a moved parent with GitHub's message |
 | `update_ref(repo, ref, sha)` | force-updates `refs/<ref>` by pushing `+<sha>:refs/<ref>` from the service's clone with the token in the `GIT_CONFIG_*` header, so the retained commit's objects (which exist only in that clone) travel with the ref; without a clone the Git Data API creates or moves the ref, which works only for objects GitHub already has (retained candidate refs, never the base branch). The controller pushes the head's retained ref this way before every dispatch, since CI checks the candidate out by SHA |
 | `post_comment(repo, number, body, marker) -> str` | appends `<!-- tauceti-queue <marker> -->`; a comment already carrying the marker is edited (or left alone when identical), never duplicated |
 | `set_labels(repo, number, add, remove)` | `POST /issues/{n}/labels` and `DELETE /issues/{n}/labels/{name}` (404 tolerated) |
+| `ensure_label(repo, name, color, description)` | `POST /labels` (422 `already_exists` tolerated) |
 | `close_pr(repo, number, title)` | `PATCH /pulls/{n} {state: closed, title}`, bookkeeping fields only, as Bors's `close_merged_pr`; the controller passes the `[Merged by Bors] - ` title |
 | `repository_admin(login, repo=None) -> bool` | `GET /collaborators/{login}/permission` is `admin` (the `security_audit.require_admin` predicate); `reviewer(login)` is Bors's reviewer check, push access (`admin`, `maintain`, `write`) |
 | `rate_limit() -> (int, float)` | from the last response headers, else `GET /rate_limit` |
@@ -124,12 +125,17 @@ controller uses those alone for classification and hands the rest to the repair 
 
 ## Admission: how approvals arrive
 
-Bors takes approvals from three sources; the queue takes the same three.
+With `admission_source = "policy"`, the queue reads published scoreboards, current head/base and
+diff, scope/build/bump results and trusted recovery holds through the shared TauCetiReview policy.
+The installed policy and trusted project configuration determine eligibility; the queue records
+`admission_policy` evidence and admits directly. It requires no model calls. The existing discovery
+and approval-poll thread own pending work and missed policy observations; see
+[Primary admission](operations.md#primary-admission).
 
 **Comment commands.** `bors r+`, `bors merge`, `bors r=login`, `bors p=N`, `bors r-`, `bors cancel`
 in issue comments and review bodies, from collaborators with push access, parsed below.
 
-**The review App's eligibility checks.** TauCetiReview no longer comments `bors r+`: its reusable
+**Legacy eligibility checks (explicit pre-cutover mode only).** TauCetiReview's reusable
 `merge-only.yml` and `merge-sweep.yml` run `runner/backend.py eligibility`, which publishes an
 App-owned check run named `merge eligibility` on the reviewed head (App 3947238,
 `tauceti-review-bot[bot]`). The check's `external_id` is the decision, `{"schema":
@@ -147,10 +153,14 @@ nothing. The checks describe eligibility independently of `MERGE_BACKEND`. Behin
 reconciles the decisions the controller has not recorded (`docs/queue/operations.md`, "Approval
 polling"), so an inactive or lossy webhook cannot lose an approval or a revocation.
 
-**The review App's exact-head comments.** `bors r+ sha=<head>`, `bors r+ single sha=<head>` and
-`bors r- sha=<head>` are still accepted from comments whose `performed_via_github_app.id` is the
+**Legacy exact-head comments (explicit pre-cutover mode only).** `bors r+ sha=<head>`, `bors r+ single sha=<head>` and
+`bors r- sha=<head>` are accepted from comments whose `performed_via_github_app.id` is the
 review App, and only while the live head is that SHA, as Bors's webhook accepts them (the legacy
 path of the same App).
+
+Policy mode ignores both legacy automated sources, including late in-flight publications. Manual
+commands retain their permission and membership rules. There is no automatic switch to legacy
+intake or to the old Bors engine during an inference outage.
 
 Every approval reaches the controller as `approve(repo, pr, head_sha, reviewer, priority,
 evidence)` with the evidence as a dict (`commands.Evidence`): the source kind (`issue_comment`,
@@ -158,6 +168,69 @@ evidence)` with the evidence as a dict (`commands.Evidence`): the source kind (`
 or check id and URL, its time, the head approved, the command as typed, `single`, `admin`, and for
 repository admins the merge base of that head against the base branch, which is what Bors's
 `ManualApproval.grant` records and what the scope-approval check reads back as `scope_approvals`.
+
+## Repair or reject: comments and the `dont-repair-in-queue` label
+
+Repair in place is the default; the author chooses rejection with a label (the plan's "Repair or
+reject: the author's choice").
+
+**The landing comment of an edited member.** A member whose provenance is not `clean` gets Bors's
+notice followed by the queue's edit summary: the batch, a link to the landed commit, the
+explanations the agents appended to its message (quoted), and a collapsed `<details>` block with
+`git diff <accepted head> <landed commit>` restricted to the PR's own files (those its branch
+changes since its merge base with the landed commit, plus those the landed commit changes), in a
+fenced `diff` block. A diff longer than 400 lines shows the first 400 and a note with the full
+line count and a link to the commit. Then the earlier edited revisions, the PRs the explanation
+mentions and the retained ref, as before. Each summary is journaled as `edit-summary` (number,
+commit, accepted head, `diff_lines`, `truncated`) and counted in `edit_summaries`. A clean member's
+comment is unchanged.
+
+**The `repaired-in-queue` label.** Beside `dont-repair-in-queue` (the author's opt-out) and
+`needs-rebase` (the author must act), the queue marks the PRs it changed: every landed member that
+gets an edit summary also gets the `repaired_label` setting's label (default `repaired-in-queue`;
+the empty string disables it) through an outbox `labels` entry keyed
+`repaired-label:<batch>:<pr>`. A clean member gets none, and neither does a member whose landed
+commit is the empty one carrying the landing note (its PR was already on `main`). The first such
+entry a controller process performs creates the label in the repository when it is missing
+(`ensure_label`, `POST labels`, an existing label left as it is) with the description "The merge
+queue modified this contribution while integrating it; see the landing comment"; later entries
+skip that call.
+
+**The label.** A PR carrying one of the `no_repair_labels` (a runtime setting, default
+`["dont-repair-in-queue"]`, compared case-insensitively) is never edited by an agent. The controller
+reads the labels `fetch_pr` returns at approval into the input's `no_repair` flag, copies it to the
+member at insertion, and refreshes both from `pull_request` `labeled` and `unlabeled` deliveries
+for that label (the payload's `pull_request.labels` when present, else the action), journaled as
+`no-repair` and counted in `no_repair_opt_outs`. The task record carries `no_repair` per member and
+the repair prompt lists those members under "Do not edit": if a fix needs a change to one, the agent
+reduces it to an empty commit and appends three lines naming the cause, `Interacting-PR: #N`,
+`Interacting-File: <path>` and `Finding: <conflict, duplicate declaration, rename ripple or build
+error>: <sentence>`. A submission that changes such a member other than by emptying it (or by the
+queue's own empty commit for a PR already on `main`) is rejected as `no-repair-edited`.
+
+**The withdrawal comment.** When an adopted chain (a repair, a rebase conflict, a preparation, or
+a pre-rebase the seal uses) has emptied a `no_repair` member, the PR is withdrawn as
+`problem-anticipated` and gets one comment (marker `anticipated:<input id>`): it carries the label,
+so the queue did not edit it; integrating it in batch N needed a change, so its commit there is
+empty and it will not be closed as merged; then a list with the interacting PR, the file and the
+finding parsed from the agent's message (the PR falls back to the first other PR the message
+mentions; a missing file or finding reads "not named"; without any PR the comment says the queue
+could not attribute the change and asks for a rebase and a new approval); then that the problem is
+not yet reproducible on the author's branch because the other PR is still in staging, that the
+queue comments again and applies `needs-rebase` when it lands, and that the PR is re-admitted at
+its original age if the other PR leaves the queue without landing; then the agent's note, quoted.
+No label changes at withdrawal. If the interacting PR is already on `main`, the comment says the
+problem is reproducible now and `needs-rebase` is applied at once.
+
+**`needs-rebase` and re-admission.** When the interacting PR lands (its head landing, or a
+canonical advance whose commits carry its `Source-PR` trailer or ` (#N)` subject), the PR gets a
+second comment (marker `needs-rebase:<input id>`) saying the problem is now reproducible, with the
+same list, and the label `needs-rebase` through the outbox's `labels` entry; it re-enters through
+ordinary re-approval (the approval poll treats the `problem-anticipated` input as consumed until a
+newer eligibility check). When the interacting PR leaves the queue without landing (its input is
+cancelled or closed and it is not on `main`), the withdrawn input waits again at its original
+`approved_at` if the PR is still open at the accepted head and carries no keep label, with a
+comment (marker `readmitted:<input id>`) saying so; otherwise the comment asks for a new approval.
 
 ## Commands
 
@@ -374,3 +447,26 @@ traceback logged. Workers push their result chain to the task's `submission_ref`
   and `create_server(..., status=..., adapter=..., app=...)`; it serves status only while the
   credentials or the content clone are missing, and the status document's `feeds.observation` is
   Bors's path.
+
+## Frozen admission authority for scope verification
+
+The native controller's successful active-batches observation responses include
+`TauCeti-Admission: frozen-accepted-head/v1`. This is an assertion by the same
+HTTPS authority that supplies the batch and its scope approvals: member heads
+are retained accepted commits; branch pushes, draft changes, retargeting and
+closure do not reopen admission after insertion. Scope approval records remain
+bound to their accepted head and admission merge base. The v1 JSON body is
+unchanged. Compatibility FeedSource implementations, candidate feeds and errors
+do not carry this assertion.
+
+Workflow-pinned tooling may use that header to inspect complete immutable member
+diffs instead of mutable PR files. It must still check exact batch head/base,
+restricted-path approval by a current effective repository admin, complete
+combined-path coverage, and a final authority refresh. Individual PR checks keep
+their live revision rules. A missing or unknown header retains legacy Bors rules;
+JSON fields or contributor dispatch data cannot enable frozen semantics.
+
+Deploy the capable Tools reader and its trusted workflow pin before enabling the
+native header in production. Verify the header end to end, then let a fresh
+normal CI attempt produce its own scope verdict; never manufacture a passing
+status to release a blocked batch.

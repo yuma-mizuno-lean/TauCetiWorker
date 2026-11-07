@@ -35,6 +35,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from tauceti_queue import declaration_names as compiled_names
 from tauceti_queue.repair import LISTINGS_DIR, ChainCommit, git
 
 FILES_FILE = "files.jsonl"
@@ -186,12 +187,14 @@ class MemberContext:
     removed: dict[str, str] = dataclasses.field(default_factory=dict)  # full name -> file
     written: dict[str, str] = dataclasses.field(default_factory=dict)  # full name -> name as written
     renamed: list[tuple[str, str]] = dataclasses.field(default_factory=list)
+    declaration_names: dict = dataclasses.field(default_factory=dict)
+    added_approximate: bool = True
 
     def files_record(self) -> dict:
         return {"position": self.position, "pr": self.pr, "commit": self.commit, "files": self.files}
 
     def decls_record(self) -> dict:
-        return {
+        record = {
             "position": self.position,
             "pr": self.pr,
             "commit": self.commit,
@@ -200,6 +203,15 @@ class MemberContext:
             "removed": sorted(self.removed),
             "renamed": [list(pair) for pair in self.renamed],
         }
+        if self.declaration_names:
+            record.update(
+                declaration_names=self.declaration_names,
+                compiled_added=self.declaration_names["added"],
+                added_approximate=self.added_approximate,
+                removed_approximate=True,
+                renamed_approximate=True,
+            )
+        return record
 
 
 def changed_files(clone: Path, commit: ChainCommit) -> list[FileChange]:
@@ -260,7 +272,13 @@ def _shards(items: list[str], count: int) -> list[list[str]]:
 
 
 def member_contexts(
-    clone: Path, chain: list[ChainCommit], pool: concurrent.futures.Executor, jobs: int
+    clone: Path,
+    chain: list[ChainCommit],
+    pool: concurrent.futures.Executor,
+    jobs: int,
+    *,
+    declaration_names: dict[int, dict] | None = None,
+    edited_prs: set[int] | None = None,
 ) -> list[MemberContext]:
     members = [MemberContext(index + 1, commit.pr, commit.sha) for index, commit in enumerate(chain)]
     changes = list(pool.map(lambda commit: changed_files(clone, commit), chain))
@@ -293,6 +311,21 @@ def member_contexts(
         member.added = {name: path for name, path in added.items() if name not in moved}
         member.removed = {name: path for name, path in removed.items() if name not in moved}
         member.renamed = [pair for pair in pairs if pair[0] not in moved and pair[1] not in moved]
+    for member, commit in zip(members, chain, strict=True):
+        record = compiled_names.accepted((declaration_names or {}).get(member.pr), commit.accepted_head or "")
+        if record is None:
+            continue
+        member.declaration_names = record
+        # An accepted snapshot cannot replace names changed by a prior agent round. Keep it
+        # beside the current scan as attribution evidence instead. Empty members add nothing.
+        if member.pr in (edited_prs or set()) or commit.empty:
+            continue
+        member.added = {
+            name: module.replace(".", "/") + ".lean" for module, names in record["added"].items() for name in names
+        }
+        member.added_approximate = False
+        for name in member.added:
+            member.written.setdefault(name, name.rsplit(".", 1)[-1])
     return members
 
 
@@ -506,6 +539,16 @@ class RepairContext:
             "below with line numbers; `grep` them for a name, a file or a PR number (all ignored by Git).",
             "",
         ]
+        exact = sum(not m.added_approximate for m in self.members)
+        if any(m.declaration_names for m in self.members):
+            lines[3] = (
+                f"`{LISTINGS_DIR}/{DECLS_FILE}` includes compiled `DECLARATION-NAMES` snapshots of the accepted PRs "
+                f"with their head, tested base and build identity ({exact} clean members use compiled added names). "
+                "Previously edited members retain the current text-derived additions alongside that accepted snapshot. "
+                "Removed names, rename pairs and uses are approximate; missing, incomplete or stale records use the text scan. "
+                f"`{LISTINGS_DIR}/{FILES_FILE}` lists file ownership and `{LISTINGS_DIR}/{COLLISIONS_FILE}` lists "
+                "predicted collisions and ripples. The worker's audits remain the checks."
+            )
         if not self.collisions and not self.ripples:
             lines.append(
                 "No declaration name is added by two members and no removed name is still referenced, as far as the "
@@ -528,6 +571,146 @@ class RepairContext:
         return lines
 
 
+# ---- across two batches ----------------------------------------------------------------------------
+
+CROSS_BATCH_LINES = 20  # bullets in the prompt's predicted-ripples section
+
+
+def cross_batch(
+    clone: Path,
+    head: list[ChainCommit],
+    following: list[ChainCommit],
+    *,
+    jobs: int | None = None,
+    head_declaration_names: dict[int, dict] | None = None,
+    following_declaration_names: dict[int, dict] | None = None,
+    edited_prs: set[int] | None = None,
+) -> dict:
+    """The predicted interaction between the head's chain and the next batch's, for the next batch's
+    pre-rebase: ``removed_used``, the names a head member removed or renamed that a next-batch member's
+    changed files still reference at that batch's tip (``{"name", "removed_by": [{position, pr, file,
+    renamed_to?}], "references": [{file, position, pr, lines}]}``, positions in the head and in the next
+    batch respectively), and ``added_by_both``, the names a member of each batch adds (``{"name", "head":
+    [...], "next": [...]}``). Text-derived like ``compute``, so ``approximate``; never raises (an error is
+    recorded as ``error`` with both lists empty)."""
+    started = time.monotonic()
+    jobs = jobs or min(32, (os.cpu_count() or 4) * 2)
+    record: dict = {"approximate": True, "removed_used": [], "added_by_both": []}
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            ahead = member_contexts(
+                clone, head, pool, jobs, declaration_names=head_declaration_names, edited_prs=edited_prs
+            )
+            behind = member_contexts(
+                clone, following, pool, jobs, declaration_names=following_declaration_names, edited_prs=edited_prs
+            )
+            removers: dict[str, list[MemberContext]] = {}
+            for member in ahead:
+                for name in member.removed:
+                    removers.setdefault(name, []).append(member)
+            re_added = {name for member in behind for name in member.added}
+            texts: dict[str, set[str]] = {}
+            for name, who in removers.items():
+                if name in re_added:
+                    continue
+                texts.setdefault(name, set()).add(name)
+                written = who[0].written.get(name, name)
+                if written != name and len(written) >= SHORT_NAME:
+                    texts.setdefault(written, set()).add(name)
+            owners: dict[str, list[MemberContext]] = {}
+            for member in behind:
+                for path in member.files:
+                    owners.setdefault(path, []).append(member)
+            found = _references(clone, following[-1].sha, dict.fromkeys(texts), pool) if following and texts else {}
+        for name in sorted({n for names in texts.values() for n in names}, key=lambda n: (removers[n][0].position, n)):
+            references: dict[tuple[str, int], set[int]] = {}
+            for text in (t for t, names in texts.items() if name in names):
+                for path, lines in found.get(text, {}).items():
+                    for owner in owners.get(path, []):
+                        references.setdefault((path, owner.position), set()).update(lines)
+            if not references:
+                continue
+            by_position = {m.position: m for m in behind}
+            removed_by = []
+            for member in removers[name]:
+                entry = _who(member, member.removed[name])
+                renamed_to = [new for old, new in member.renamed if old == name]
+                if renamed_to:
+                    entry["renamed_to"] = renamed_to[0]
+                removed_by.append(entry)
+            record["removed_used"].append(
+                {
+                    "name": name,
+                    "removed_by": removed_by,
+                    "references": [
+                        {"file": path, "position": position, "pr": by_position[position].pr, "lines": sorted(lines)}
+                        for (path, position), lines in sorted(references.items(), key=lambda kv: (kv[0][1], kv[0][0]))
+                    ],
+                }
+            )
+        added_ahead: dict[str, list[dict]] = {}
+        for member in ahead:
+            for name, path in member.added.items():
+                added_ahead.setdefault(name, []).append(_who(member, path))
+        for member in behind:
+            for name, path in sorted(member.added.items()):
+                if name in added_ahead:
+                    entry = next((e for e in record["added_by_both"] if e["name"] == name), None)
+                    if entry is None:
+                        entry = {"name": name, "head": added_ahead[name], "next": []}
+                        record["added_by_both"].append(entry)
+                    entry["next"].append(_who(member, path))
+    except Exception as error:  # the pre-rebase goes ahead without the prediction
+        record.update(removed_used=[], added_by_both=[], error=f"{type(error).__name__}: {error}")
+    record["seconds"] = round(time.monotonic() - started, 3)
+    return record
+
+
+def cross_batch_lines(record: dict | None) -> list[str]:
+    """The prompt's "Predicted ripples from the head" section for a pre-rebase; empty when there is
+    nothing to say."""
+    if not record or not (record.get("removed_used") or record.get("added_by_both")):
+        return []
+    bullets = []
+    for entry in record.get("removed_used") or []:
+        removers = [
+            _member_text(who, f"renamed to `{who['renamed_to']}`" if who.get("renamed_to") else None)
+            for who in entry["removed_by"]
+        ]
+        users = [
+            f"`{r['file']}` (position {r['position']}, PR #{r['pr']})" for r in entry["references"][:REFERENCES_SHOWN]
+        ]
+        more = len(entry["references"]) - REFERENCES_SHOWN
+        if more > 0:
+            users.append(f"{more} more file{'s' if more > 1 else ''}")
+        bullets.append(
+            f"- `{entry['name']}` is removed by the head's "
+            + _join(removers)
+            + " and used in this batch's "
+            + _join(users)
+        )
+    for entry in record.get("added_by_both") or []:
+        bullets.append(
+            f"- `{entry['name']}` is added by the head's "
+            + _join([_member_text(w) for w in entry["head"]])
+            + " and by this batch's "
+            + _join([_member_text(w) for w in entry["next"]])
+        )
+    lines = [
+        "",
+        "## Predicted ripples from the head",
+        "",
+        "The head batch this chain is being rebased onto removes, renames or adds these declaration names; the "
+        "names come from the text of each member's diff, so they are approximate. Each is likely to break this batch "
+        "once it sits on the head, so fix the members of this batch that use them while you rebase:",
+        "",
+    ]
+    lines += bullets[:CROSS_BATCH_LINES]
+    if len(bullets) > CROSS_BATCH_LINES:
+        lines.append(f"- and {len(bullets) - CROSS_BATCH_LINES} more in the task's `cross_batch` diagnostics")
+    return lines
+
+
 def write_files(context: RepairContext, worktree: Path) -> None:
     directory = worktree / LISTINGS_DIR
     directory.mkdir(parents=True, exist_ok=True)
@@ -537,7 +720,14 @@ def write_files(context: RepairContext, worktree: Path) -> None:
 
 
 def compute(
-    clone: Path, chain: list[ChainCommit], target: str, worktree: Path, *, jobs: int | None = None
+    clone: Path,
+    chain: list[ChainCommit],
+    target: str,
+    worktree: Path,
+    *,
+    jobs: int | None = None,
+    declaration_names: dict[int, dict] | None = None,
+    edited_prs: set[int] | None = None,
 ) -> RepairContext:
     """The entry point: the members' files and declarations, their collisions and rename ripples
     against the chain tip and ``target`` (the commit the result must sit on), written to
@@ -546,7 +736,9 @@ def compute(
     jobs = jobs or min(32, (os.cpu_count() or 4) * 2)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-            members = member_contexts(clone, chain, pool, jobs)
+            members = member_contexts(
+                clone, chain, pool, jobs, declaration_names=declaration_names, edited_prs=edited_prs
+            )
             found_collisions = collisions(members)
             found_ripples = ripples(clone, members, chain[-1].sha, target, pool) if chain else []
         context = RepairContext(members, found_collisions, found_ripples, time.monotonic() - started)

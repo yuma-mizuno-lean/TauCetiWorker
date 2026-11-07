@@ -9,6 +9,23 @@ preparation, prompt, agent run, chain checks) is `tauceti_queue/repair.py`, fact
 historical repair experiments so the experiment CLI (`python -m tauceti_queue.repair_experiment`)
 and the task use one implementation.
 
+Each task member can also carry its accepted PR build's compiled `DECLARATION-NAMES` record.
+The service fetches this with its own App in the background (at most two reads in flight), from
+the accepted head's newest successful `build` status, the trusted `pr-build.yml` run and its
+exact attempt's `sandboxed-build` job. The log must contain one complete, bounded record naming
+that head and valid base/tested revisions. Unknown, missing, incomplete and stale records leave
+the text-derived context in place; transient reads have three attempts with persisted backoff.
+Admission, insertion and CI never wait for a record. The scheduling integration invokes
+`Controller._fetch_declaration_names(now)` once per pass and uses its changed result to refresh
+predictions.
+
+`.tauceti-repair/decls.jsonl` retains the compiled accepted snapshot and build identity. Clean
+members use its exact added names, including generated constants a source scan misses. After an
+agent edits a member, its current additions come from the approximate scan, with the original
+compiled additions beside them as evidence. Removals, renames and reference ripples remain
+explicitly approximate. Cross-batch predictions use the same rules. These are navigation and
+admission predictions; the worker's verification audits and the candidate's CI remain authoritative.
+
 ```sh
 uv run python -m tauceti_queue.repair_task --service https://queue.example [--once | --check] [--worker ID]
     [--clone PATH] [--root PATH] [--repository owner/repo] [--poll SECONDS]
@@ -62,14 +79,19 @@ repeated for a task whose repository differs from the configured one.
 | `POST /tasks/<id>/result` | `{worker, claim_token, tip_sha, pushed_ref, worker_notes}` | the `Adoption` record |
 | `POST /tasks/<id>/release` | `{worker, claim_token, reason, error}` | `{task_id, released}`; `404` when the service has no such route |
 
-`Task` (`ports.Task.to_dict`): `task_id`, `kind` (`repair` or `rebase_conflict`), `repository`,
-`batch_id`, `batch_version`, `base` and `tip` (the chain to start from), `onto` (the commit the
-replacement must be based on: the canonical commit for a rebase conflict, `base` itself for a
-repair), `members` (`source_pr`, `number`, `accepted_head`, `commit`, `provenance`, `title`,
+`Task` (`ports.Task.to_dict`): `task_id`, `kind` (`repair`, `rebase_conflict`, `pre_rebase` or `prepare`),
+`repository`, `batch_id`, `batch_version`, `base` and `tip` (the chain to start from), `onto` (the
+commit the replacement must be based on: the canonical commit for a rebase conflict, the head's tip
+for a pre-rebase of the next open batch, `base` itself for a repair or a preparation, and the head's
+tip, like `base`, for a preparation of the pre-rebased chain), `members` (`source_pr`, `number`, `accepted_head`, `commit`, `provenance`, `title`,
 `description`, `author`, `explanation`, `retained_ref`), `diagnostics`, `retained_refs`,
 `submission_ref`, `claim_token`, `expires_at`, `instruction` (the plan's agent instruction, used
 verbatim as the prompt's first paragraph), `created_at`, `extra`. The runner renews every
-`extra.renew_after` seconds when the service sets it, else every third of the claim's lifetime.
+`extra.renew_after` seconds when the service sets it, else every third of the claim's lifetime. A
+`pre_rebase` task is run like a `rebase_conflict` (warm artifacts from `onto` first, run cold rather
+than released); its prompt says that the target is the next head's expected base, not `main`, and
+lists the `cross_batch` diagnostic's predicted ripples from the head under "Predicted ripples from the
+head".
 
 `diagnostics` is the controller's list of findings, each `{kind, module, message}` as the CI
 adapter extracted them (`repair.findings_from_diagnostics`): `compiler`/`compiler_error` entries
@@ -110,6 +132,7 @@ controller's inference hold (`report_inference(worker, False, error)`), and `err
 | `agent_launch_failed` | the agent process could not be created at all (`OSError` from `Popen`: a missing executable, an argv the kernel rejects); the artifacts were ready, so no `artifacts_backoff` applies, and the error names the launch as the cause. A prompt longer than `agents.PROMPT_ARGV_LIMIT` (64 KiB) is written to the agent's stdin rather than passed in argv, since Linux rejects a single argument above 128 KiB |
 | `agent_failed` | the agent ran and exited on its own terms, or returned a chain that fails local validation, twice; the task is re-exposed to any worker |
 | `push_failed` | `git-safe-push` to the submission ref failed; the chain is retained locally under `refs/tauceti-queue/task/<id>/attempt-<n>` in the worker's clone |
+| `prepared_clean` | a `prepare` task's open batch built on its base without an error, so there was nothing to repair; the controller records the batch version as prepared |
 
 Stream F's server does not route `/tasks/<id>/release` yet; when the endpoint answers `404` the
 runner records `release_unsupported`, stops renewing and lets the claim expire, and the controller
@@ -182,6 +205,31 @@ has a time budget holds because the service re-exposes the task.
    any public revision; `cache_service` records which service the restored mapping came from.
    Checkpoint `artifacts_ready`.
 
+   **Warm revisions.** A `pre_rebase` task builds on a queue head's tip, which is never on `main` and
+   so never in the public cache, and a `prepare` task builds a batch whose own tips the workers may
+   already have published. The controller therefore puts `warm_revs` on every `pre_rebase` and
+   `prepare` task record, computed at claim time (`Controller._warm_revs`): for a `pre_rebase`, the
+   head's current tip and its previous tips (newest first, up to `REPAIR_OUTPUTS_PREVIOUS_TIPS`, from
+   `batch_tips`), then the head's base; for a `prepare` of the pre-rebased chain, the head's tips, then
+   the batch's own tips (the one the pre-rebase covers first); for a `prepare` on its own base, the
+   batch's previous tips, then that base. Every kind also lists the tips of the last two landed heads
+   (`Controller._landed_tips`, see controller.md) after those batch tips and before the base. Before the agent runs, the worker fetches the repair namespace's outputs for every one
+   of them, then for the task's `tip`, `onto` and `base` (`repair_publish.warm`, without repeats). All
+   are tried, not only the first that answers: Lake keys outputs by input trace, so each mapping adds
+   the artifacts of its own tree and a nearly identical tree's outputs serve nearly completely. A
+   revision without a mapping is skipped. For a `pre_rebase` the public walk then starts at the last warm
+   revision (the head's base, a `main` commit) rather than at the head's tip. The record carries `warm_attempts`
+   and `warmed_from`, and the worker logs `repair outputs warmed the tree from <shas>; no published
+   mapping for <shas>`. A warm hit alone makes the artifacts available. The prompt for every task kind
+   (`repair.CACHE_SENTENCE`) says the worker has already placed every artifact it could find, that the
+   agent must not run `lake exe cache get` or any other cache fetch, that a public-cache miss for a
+   queue head's tip is expected and is no reason to stop, and that it proceeds to build
+   incrementally. The queue launches agents with `run_agent_host(..., cache_note=False)`, so the
+   fleet's build-cache appendix (its fetch commands and the stop rule for `TAUCETI_PR_CACHE_MISS`) and
+   that variable never reach a queue agent; the fleet's own rounds keep both. Production batch 3's
+   `pre_rebase` task (2026-11-05) is the case: Codex fetched the public cache itself, found nothing for
+   head 2's tip, followed the appendix's stop rule and aborted the replay twice.
+
    **Sandboxed builds.** Every `lake build` the worker runs goes through
    `repair_sandbox.sandboxed_lake(argv, worktree, env)` (`tauceti_queue/repair_sandbox.py`), which wraps
    it in the offline `bwrap` sandbox CI's required build uses (TauCeti `pr-build.yml`, "Build exact
@@ -242,17 +290,21 @@ has a time budget holds because the service re-exposes the task.
    directory is excluded from Git through the clone's `info/exclude`, so no recipe the agent runs can
    commit it, and `checkout_worktree` leaves it alone; a prompt composed without a worktree (the
    experiment's preview) carries the listings inline. The verification advice follows
-   the artifacts outcome: with warm artifacts it describes the incremental whole-library build; when a
+   the artifacts outcome: a warm rebase fetches cached outputs without compiling the old chain and
+   asks the agent to finish the replay before building the resulting chain. Other warm tasks describe
+   the incremental whole-library build; when a
    rebase conflict runs without them (`cold`) it says so, gives the reason, warns that
    `lake build --iofail` starts from nothing and may take hours, and asks for the touched modules
    (`lake build <Module>`) to be built first. Either way the prompt tells the agent to check a fix
    with the scoped build first and to run the whole-library `lake build --iofail` only as the final
    verdict: `.tauceti-repair/build` (written by `repair_tools.write_build_script` beside the check
-   script, a Python script of under sixty lines) takes module names (`TauCeti.Foo.Bar`) or paths
+   script, a Python script of under eighty-five lines) takes module names (`TauCeti.Foo.Bar`) or paths
    (`TauCeti/Foo/Bar.lean`), with `--dependents` every module importing them transitively (from the
    library's `import` lines, read in one pass and cached in `.tauceti-repair/imports.json`, which the
    worker drops whenever it rewrites the script), and runs `lake build --iofail` on them in the
-   foreground, exiting with Lake's status; with no arguments it builds the whole library. Every build
+   foreground, exiting with Lake's status; with no arguments it builds the whole library and, when that
+   is green, runs CI's audits and the changed-module lint (below; `--no-audit` skips them, a scoped build
+   prints that they run on the whole-library build). Every build
    in the worktree holds the lock directory `.tauceti-repair/build.lock`, taken atomically by `mkdir`
    with the holder's pid in `pid` inside: a waiter polls every 2 s, prints a line every 30 s, and
    clears a lock whose holder has died. The worker's own builds hold the same lock through
@@ -299,8 +351,38 @@ has a time budget holds because the service re-exposes the task.
    the same attempt. A chain that fails validation, a dirty worktree, or a HEAD still at the input
    tip is not acceptable: one bounded retry (`agent_attempts`, 2) with the local report and the
    retained input ref appended to the prompt, then `agent_failed`. Checkpoint `validated`.
-6. **Publish and submit.** Publish the build outputs (below), push, `result`, record the response (checkpoints `pushed`, `submitted`,
-   then `adopted` or `not_adopted`). The worktree is removed afterwards unless `--keep-worktree`;
+   **CI's audits on the worker** (`tauceti_queue/repair_audit.py`; setting `TAUCETI_QUEUE_WORKER_AUDITS`,
+   default on, and `--no-worker-audits`). Head 2's first CI round after a green worker build failed in the
+   audit phase on a duplicate declaration the agent's text scan had listed and set aside, so the checks are
+   the worker's, not the agent's. After every green whole-library `lake build --iofail` it runs (the
+   streaming build, the parallel path's verification build, the verification below and the agent's
+   `.tauceti-repair/build` without module arguments) it runs what CI's `sandbox-build.sh` runs after its
+   build: the `audit-driver` under `lake env timeout 3000s` (import of every TauCeti module, duplicate
+   declarations, axioms) and `lint-env.sh` with the `lint-env-driver` on the TauCeti modules changed between
+   the task's base and HEAD (`lint-scope.sh`'s module list for a batch). The sources are the TauCetiTools pin
+   the worktree's `tauceti.toml` names (`[tools.tools] repo`, `ref`): fetched once into
+   `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and the worktree's
+   `scripts/` as policy directory into `.lake/tauceti-repair-audit/scripts`, with both drivers compiled by the
+   pinned `build-lint-driver.sh` and `build-audit-driver.sh` inside the sandbox (reused while pin, toolchain
+   and manifest are unchanged); the audit and the lint run in the sandbox too. Their output is read by
+   `diagnostics.parse_log`, so each finding is the diagnostic the controller would create from CI
+   (`{"kind": "audit", "module", "path", "message": "duplicate-declarations: ..."}` once per TauCeti module,
+   `lint` with its location), and it is appended to `.tauceti-repair/errors.jsonl` beside the compiler errors.
+   `repair.findings_from_diagnostics` turns a duplicate into one entry naming both modules, and the parallel
+   path keeps both owners in one group. When the checks cannot run at all (no pin, a failed fetch,
+   materialization or driver build) they are recorded as `unavailable` and logged, and CI remains the only
+   check. For a repair with warm artifacts, after the chain checks pass the worker runs its own verification
+   (`repair_audit.verify`, under the build lock: the whole-library build, then the checks); a failure is not
+   submitted: the agent is run again with the findings as the task's diagnostics and the report as feedback,
+   up to `verify_retries` (2) times, then the task is released as `agent_failed`. Each verification is in the
+   outcome's `verification` list. The prompt says only that the helper and the worker's verification run CI's
+   audits and lints and that the task cannot be submitted until they pass. CI's module-system check and
+   source style lint are not run on the worker. In CI runs of 2026-11-05 on the full library (24,455 TauCeti
+   modules) the audit's import took 5 s warm and 27 s cold, the duplicate check 3 s and the axiom scan of a
+   PR's few modules 4 s; the lint of five changed modules took 45 s and the two driver builds about 4 s.
+6. **Submit and publish.** Push, `result`, record the response (checkpoints `pushed`, `submitted`,
+   then `adopted` or `not_adopted`), then publish the build outputs (below). The worktree is removed
+   afterwards (by the background publisher when one runs) unless `--keep-worktree`;
    the artifact pool is kept, since the next task on the same base reuses it (prune it with the
    experiment CLI's `prune`). Every attempt's tip stays under
    `refs/tauceti-queue/task/<id>/attempt-<n>` in the clone, and `tasks/<id>/outcome.json` holds the
@@ -325,13 +407,55 @@ When the build ends the worker appends a `build finished, exit N, M errors total
 list, removes the lock and copies the log to `tasks/<id>/logs/stream-build.log`; the outcome records
 the build under `stream_build`. The agent's final whole-library `lake build --iofail` after its fixes
 is still the only verdict. A build still running when the task ends or is interrupted is stopped and
-its lock removed. Rebase-conflict tasks, resumed tasks and `--no-stream-repair` keep the sequential
-flow: the preparation's own incremental build, then the agent.
+its lock removed. Rebase-conflict and pre-rebase tasks fetch caches and go directly to the agent,
+which finishes the replay before building the resulting chain. Resumed tasks continue their agent
+session. `--no-stream-repair` keeps ordinary repairs sequential: the preparation's own incremental
+build, then the agent.
+
+**Preparing an open batch** (`kind: "prepare"`; `docs/queue/controller.md`, "Background
+preparation"). While the head waits on CI or is repaired the controller hands out `prepare` tasks for quiet open
+batches: `base` and `tip` are the open batch's own (never the head's tip), `onto` is `base`, and
+`diagnostics` is empty because no CI run has seen the batch. The worker runs it as a repair with the
+streaming build, always, even under `--no-stream-repair`, since that build is how it learns whether
+anything fails: a build that finishes with exit 0 and no error releases the task as `prepared_clean`
+without starting an agent and publishes its outputs to the repair cache under the batch tip. When
+the build reports errors the agent (or the parallel group agents) is launched as for a repair, with
+the "What happened" section saying that the batch has not yet been tried, that it should fix what
+fails to build so the batch is ready when it becomes the head, and that nothing it does is a verdict;
+the result is validated, pushed and submitted the same way, and the controller adopts it into the
+open batch's members, which carry the repairs through the batch's later rebase as the head. The
+claim's `extra.renew_after` is 60 seconds: the controller supersedes a preparation when its batch
+seals or changes, and the refused renewal stops the agent within a minute. The submission's notes
+carry `remaining_errors` (`prepare_remaining_errors`): none when the parallel path's verification
+build passed, otherwise the compiler errors handed to the last agent (the streaming build's
+`errors.jsonl` merged with the diagnostics), which no worker build showed fixed. The controller
+passes them to the batch's later `pre_rebase` task as a `prepare_errors` diagnostic, which the
+prompt lists under "Errors the batch's preparation left".
+
+**Preparing the pre-rebased chain** (a `prepare` task whose `extra.pre_rebased` is set;
+`docs/queue/controller.md`, "Preparing the pre-rebased chain"). After an open batch's pre-rebase onto
+the head's tip, the controller hands out a second preparation of the replayed chain: `base` and
+`onto` are the head's tip, `tip` the pre-rebased tip (fetched from
+`refs/tauceti-queue/batches/<id>/pre-rebased/<tip>`), the members are the commits of that chain, and
+`extra.pre_rebased` names the batch tip it covers (`source`), the batch's own base (`batch_base`) and
+the head's base (`head_base`). The worker runs it exactly like an own-base preparation, so the
+streaming build, the parallel groups, the in-place repair with edits folded into the owning members'
+commits, the worker's audits (against the head's tip) and the submission are unchanged. Only the
+artifacts differ: the repair namespace is asked for the pre-rebased tip and then the head's tip
+(`repair_publish.preferred`), the outputs the head's repair published, and the public cache for the
+head's tip, its first-parent ancestors, then `head_base` and `batch_base` (`artifact_revisions`),
+since the public cache never has the head's tip; the log names the revision restored as the head's
+tip, the head's base or the batch's own base. The prompt's "What happened" says that the batch has
+been replayed onto the head's tip, the commit it becomes the next head on, and that the head's own
+commits below it are not the agent's to edit. A green build releases the task as `prepared_clean`
+("the batch built on the head's tip without errors"), otherwise the result is submitted, and in both
+cases the publisher then publishes the outputs for the tip: the pre-rebased tip, or the submitted
+one. The controller adopts that tip as the batch's pre-rebase, so a head that lands unchanged seals
+with it and CI's fetch for the exact staging head finds these outputs.
 
 ## Repair cache publication
 
-After a chain passes the local checks and before it is pushed, `repair_publish.publish_outputs`
-publishes the worktree's build outputs under the tip's revision to a cache namespace only the workers
+After a chain is submitted, `repair_publish.publish_outputs` publishes the worktree's build outputs under the tip's revision to a cache namespace only the workers
 read, so the next repair round on the same head and the next head's agent start warm instead of
 rebuilding what this repair built. `lake build --no-build --rehash -o <map>` writes the output map and
 exits nonzero unless every module is built and current at the tip, so only a green final build is
@@ -348,7 +472,30 @@ laid out like the public cache. The write key, the `access-key-id:secret` pair L
 bucket of its own with an R2 token scoped to it, so the worker's key cannot write the public cache
 CI publishes to (`LAKE_CACHE_KEY` in TauCeti's `publish-lake-cache.yml`). `TAUCETI_QUEUE_PUBLISH_CACHE`
 (`1`/`0`) switches publication on or off; unset, it is on when the key file and an upload URL are
-configured. CI never fetches from this namespace, so its verdicts are unchanged.
+configured. CI fetches from this namespace only the exact staging head (TauCetiTools
+`repair-cache-get.sh`), and Lake still checks every trace against the candidate's inputs, so its
+verdicts are unchanged.
+
+Publication never delays the submission. On 2026-11-05 head 2's repair validated at 09:18:58 UTC and
+the publish step (the `--no-build --rehash` pass over about 26,000 modules, then the upload) ran for
+more than 12 minutes before the chain was submitted, and CI, dispatched only after submission, waited
+with the whole queue. `TAUCETI_REPAIR_PUBLISH` (`after`, the default; `before`; `off`) now chooses
+the order. Under `after` the worker pushes and submits exactly as before (the same checkpoint token,
+the claim released or adopted by the submission) and then starts `repair_publish.start_background`
+for the submitted tip, after `adopted` or `not_adopted` and after a `prepared_clean` release, and
+goes on to its next claim. The publisher is a process of its own: under systemd a transient unit
+(`systemd-run --user`, since the worker unit's `KillMode=mixed` kills whatever is left in its cgroup
+on a stop or restart), elsewhere a new session, so a stopping worker does not take it down. It writes
+`tasks/<id>/logs/publish.log` and its record `tasks/<id>/logs/publish.json` (`published`, `skipped`
+or `failed`), removes the task's worktree when done, and `worker.json` reports running publications,
+counts and the last result and failure under `publish`; a failure is logged there and in the journal
+and never changes the task's outcome. Both the rehash and `lake cache put` run under `nice -n 10`, so
+a concurrent repair or build on the host keeps the CPU. `lake cache put` uploads every artifact
+before the revision mapping the fetcher reads, and exits without writing the mapping when an
+artifact upload fails, so CI never sees a mapping for a partially uploaded set; a publisher killed
+mid-upload leaves no mapping, which the fetch script treats as the normal miss. `before` keeps the
+first ordering (publish in the task, before the push) and `off` publishes nothing; the read side is
+unchanged in all three.
 
 ## Parallel agents within one task
 
@@ -388,10 +535,14 @@ through it, and the worker's verification build holds the lock through `repair_t
 every one of these builds runs in the offline sandbox (`repair_sandbox.sandboxed_lake`), which binds
 a group worktree's symlinked `.lake/packages` read-only from its target. When
 every agent has finished the worker collects each group's commits (they must all be `fixup!` or
-`squash!` commits, the fixups touching only the group's files, on a clean tree; anything else makes
-the group `unusable`), cherry-picks them onto the tip in the task's worktree, folds them with
-`GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash --keep-empty --empty=keep <base>`, validates the
-chain with `repair.chain_report` and runs the one whole-library `lake build --iofail`. A group whose
+`squash!` commits, both kinds touching only the group's files, on a clean tree; anything else makes
+the group `unusable`). Each target must uniquely identify an original member belonging to that
+group. The worker cherry-picks the accepted changes to capture their combined reference tree,
+then rebuilds the attributed members in order using Git object-store merges and commits. It
+preserves each member's author, date and raw message, appends squash explanations, and retains
+one commit even when a repair makes that member empty. The rebuilt tree must equal the reference
+tree. It then validates the chain with `repair.chain_report` and runs the one whole-library
+`lake build --iofail`. A group whose
 agent failed, whose commits were unusable or did not apply, or whose module still fails that build
 goes back to the sequential path: phase 4's usual agent runs on the task's worktree (now holding the
 folded chain) with only the remaining findings, and the ordinary retry and release rules apply from
@@ -519,8 +670,10 @@ run, `resume_pending(cfg, client)` for checkpointed tasks. Integrating it as a w
   agent's shell limits, and a loop that owns the round should pass its remaining time as
   `agent_timeout`.
 
-The service's `repair_concurrency` setting bounds how many workers hold the head's repair task at
-once; the runner itself claims one task at a time.
+The service's `repair_concurrency` setting bounds live claims across distinct tasks. Each task has
+one live owner: one worker repairs the head while another prepares the next eligible batch. A spare
+worker waits if no separate task is claimable. Expiry or release allows another worker to take over;
+the runner itself claims one task at a time.
 
 ## Tests
 
@@ -557,4 +710,6 @@ fixups folded into a valid chain that is adopted, the groups taken from the stre
 sandbox wrapper, a group whose agent fails (or whose fixups stray outside its files) handed to the
 sequential agent, a lost claim stopping the group agents, the build lock serializing two concurrent
 scoped builds and taking over a stale lock, a provider-neutral group prompt, and dependent or
-unassignable failures staying sequential. No real inference and no network.
+unassignable failures staying sequential. A `prepare` task whose batch builds is released as
+`prepared_clean` without an agent, and one whose batch fails is repaired with the not-yet-tried
+prompt and adopted. No real inference and no network.
