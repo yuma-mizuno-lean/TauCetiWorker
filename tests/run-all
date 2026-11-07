@@ -131,6 +131,7 @@ RUN_STDLIB=(
   oauth_user_agent.py
   observability_failures.py
   open_pr_pages.py
+  openmathos.py
   openrouter_auth.py
   overlaps.py
   pace_curve.py

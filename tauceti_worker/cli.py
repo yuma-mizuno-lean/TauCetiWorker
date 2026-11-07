@@ -1281,6 +1281,17 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         configure_api(args, agent)
     except (BudgetError, OSError) as error:
         raise Die(str(error)) from None
+    if agent == "openmathos":  # Mei fork: see openmathos.py
+        from .openmathos import api_key, authoring_only
+
+        if getattr(args, "bubble", False):
+            raise Die("--agent openmathos runs on the host only")
+        if not getattr(args, "dry_run", False):
+            api_key()  # a missing key stops the worker here, before any round
+        try:
+            only = authoring_only(only, ALLOWED_TASKS)
+        except RuntimeError as error:
+            raise Die(str(error)) from None
     # --host used to opt OUT of the bubble sandbox; running on the host is now the default, so the flag
     # is a no-op we only warn about. --bubble is the way to opt back INTO the sandbox.
     if getattr(args, "host", False):

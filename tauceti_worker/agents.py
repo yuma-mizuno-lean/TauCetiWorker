@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # annotations only; importing at runtime would invert the layer order
     from .work_units import RoundOpts, Worker
 
-from . import build_caches
+from . import build_caches, openmathos
 from .config import Config, Die, NoProgress, log
 from .constants import (
     AUTHORING_DEFAULTS,
@@ -811,7 +811,7 @@ PROMPT_ARGV_LIMIT = 64 * 1024
 
 # Providers whose CLI reads the prompt from stdin when the positional prompt is absent (`claude -p`
 # with no prompt argument) or is `-` (`codex exec -`). Kiro and the Pi runner only take argv.
-_STDIN_PROMPT_PROVIDERS = frozenset({"claude", "codex"})
+_STDIN_PROMPT_PROVIDERS = frozenset({"claude", "codex", "openmathos"})
 
 
 def prompt_on_stdin(prompt: str, profile: AuthoringProfile | str) -> bool:
@@ -877,6 +877,8 @@ def host_agent_argv(
         # already removed it from the environment (claude_api.configure_api).
         if not (env.get("TAUCETI_CLAUDE_BILLING") == "api" and not os.environ.get("TAUCETI_API_CONTEXT")):
             env.pop("ANTHROPIC_API_KEY", None)
+        if openmathos.is_openmathos(profile.provider):  # Mei fork
+            env = openmathos.process_env(env, profile.model)
         command = (
             os.environ.get("TAUCETI_CLAUDE_CMD", CLAUDE_CMD) if os.environ.get("TAUCETI_API_CONTEXT") else CLAUDE_CMD
         )
@@ -946,7 +948,7 @@ def run_agent_host(
             if profile.effort:
                 argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
             argv += [resume, "-" if stdin_text is not None else prompt]
-        elif profile.provider == "claude":
+        elif openmathos.transcript_provider(profile.provider) == "claude":
             argv += ["--resume", resume]
     if env.get("TAUCETI_RECOVERY_CONTINUATION") == "1":
         env.pop("GH_TOKEN", None)
@@ -987,6 +989,11 @@ def run_agent_host(
 
         try:
             ensure_pi_model(profile.model, env)
+        except RuntimeError as error:
+            raise AgentLaunchUnavailable(str(error)) from None
+    if openmathos.is_openmathos(profile.provider):  # Mei fork
+        try:
+            openmathos.ensure_model(profile.model)
         except RuntimeError as error:
             raise AgentLaunchUnavailable(str(error)) from None
     with host_build_cache_context(cwd, env, logdir) as prefix:
@@ -1169,7 +1176,7 @@ def run_agent_proc(
     # of stdin. Otherwise close stdin explicitly: Bubble reaches the agent through a non-PTY SSH
     # channel, so an inherited terminal becomes a non-TTY stream there; Codex then treats it as
     # additional prompt input and waits forever for EOF.
-    renderer = AgentTranscriptRenderer(provider)
+    renderer = AgentTranscriptRenderer(openmathos.transcript_provider(provider))
     quota_reader, launch_credential = None, None
     if (
         quota_cfg is not None
@@ -1302,7 +1309,7 @@ def run_agent_proc(
             "usage": dict(renderer.usage),
             "tail": list(tail)[-6:],  # the guardian's own traceback when the agent executable is missing
         }
-        if provider in {"codex", "claude"} and not renderer.active:
+        if renderer.provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
         return rc
 
@@ -1310,7 +1317,7 @@ def run_agent_proc(
         # A refund asserts that the agent never ran. Structured work events are stronger evidence
         # than transcript length, while a final structured provider diagnostic is stronger evidence
         # than Bubble prelude lines. A retry event alone is deliberately not terminal evidence.
-        if provider in {"codex", "claude"} and renderer.saw_work:
+        if renderer.provider in {"codex", "claude"} and renderer.saw_work:
             return None
         classification_text = "\n".join(tail)
         if renderer.terminal_failure_final and renderer.terminal_failure_text:
@@ -2148,7 +2155,7 @@ def ensure_bubble_home(cfg: Config) -> dict:
 def _uses_claude_credentials(work_model: str) -> bool:
     """Keep Bubble's Claude credential flag and macOS private-seed decision on one predicate."""
     models = {m.strip() for m in work_model.split(",")}
-    known_non_claude = {"codex", "kiro", *OPENROUTER_MODELS}
+    known_non_claude = {"codex", "kiro", "openmathos", *OPENROUTER_MODELS}
     return bool(models & {"claude", "sonnet"}) or not models <= known_non_claude
 
 
