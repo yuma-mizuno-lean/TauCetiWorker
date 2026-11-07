@@ -1281,17 +1281,6 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         configure_api(args, agent)
     except (BudgetError, OSError) as error:
         raise Die(str(error)) from None
-    if agent == "openmathos":  # Mei fork: see openmathos.py
-        from .openmathos import api_key, authoring_only
-
-        if getattr(args, "bubble", False):
-            raise Die("--agent openmathos runs on the host only")
-        if not getattr(args, "dry_run", False):
-            api_key()  # a missing key stops the worker here, before any round
-        try:
-            only = authoring_only(only, ALLOWED_TASKS)
-        except RuntimeError as error:
-            raise Die(str(error)) from None
     # --host used to opt OUT of the bubble sandbox; running on the host is now the default, so the flag
     # is a no-op we only warn about. --bubble is the way to opt back INTO the sandbox.
     if getattr(args, "host", False):
@@ -1414,6 +1403,19 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             ensure_openrouter_key()
         except RuntimeError as error:
             raise Die(str(error)) from None
+    # Mei fork: Open Math OS runs on the host only. Its model has no default, so the configured
+    # --author-model is published through the documented authoring variable that every profile
+    # resolution (preflights, reviews, loop children) reads; its key, like OpenRouter's, is
+    # resolved before HOME isolation. See openmathos.py.
+    if agent == "openmathos":
+        from .openmathos import ensure_key
+
+        if getattr(args, "bubble", False):
+            raise Die("--agent openmathos runs on the host only")
+        if author_model:
+            os.environ["TAUCETI_AUTHORING_OPENMATHOS_MODEL"] = author_model.strip()
+        if not getattr(args, "dry_run", False):
+            ensure_key()
     # A distinct worker id implies its own credential directories (so several workers' refreshes don't
     # race); --isolate-home forces it even for the 'default' id. This must run BEFORE Config.resolve so
     # cfg.home and the credential paths derived from it point at the per-worker copy. Off macOS that

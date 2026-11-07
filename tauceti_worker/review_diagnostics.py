@@ -31,7 +31,7 @@ _PUBLIC_CATEGORIES = {
     "review-engine",
     "review-command",
 }
-_PUBLIC_PROVIDERS = {"claude", "codex", "deepseek", "kiro", "minimax", "sonnet"}
+_PUBLIC_PROVIDERS = {"claude", "codex", "deepseek", "kiro", "minimax", "openmathos", "sonnet"}  # Mei fork: openmathos
 _PUBLIC_DETAILS = {
     "reviewer-auth": "reviewer authentication failed",
     "missing-tool": "reviewer executable unavailable",

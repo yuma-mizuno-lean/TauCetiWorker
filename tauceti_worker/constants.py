@@ -265,8 +265,9 @@ AUTHORING_DEFAULTS = {
     # id (for example claude-opus-5) with the existing --author-model flag.
     # Kiro does not serve gpt-6-sol yet (https://kiro.dev/changelog/models/).
     "kiro": ("gpt-5.6-sol", "high"),
-    # Mei fork: Claude Code against the Open Math OS gateway; see openmathos.py.
-    "openmathos": ("claude-openmathos-136586835026765720304391437666977767985", "high"),  # Kimi K3.1 Pro
+    # Mei fork: Claude Code against the Open Math OS gateway; see openmathos.py. No default model:
+    # the gateway ids are opaque and may change, so the worker's author_model is required.
+    "openmathos": (None, "high"),
 }
 
 PI_RUN = os.environ.get("PI_RUN", "")  # Optional legacy wrapper; otherwise launch pi directly.

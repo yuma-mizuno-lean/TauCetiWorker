@@ -226,7 +226,7 @@ def _dashboard_app(cfg, loader=None):
     from textual.widgets import DataTable, Footer, Input, Label, OptionList, Static
     from textual.widgets.option_list import Option
 
-    MODELS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax"]
+    MODELS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax", "openmathos"]  # Mei fork: openmathos
 
     class WorkGrid(DataTable):
         # Never take focus: the App owns ↑/↓/←/→ (move + expand/collapse). If the table grabbed focus

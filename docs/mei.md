@@ -35,30 +35,43 @@ can fall back to compilation; dependency preparation failures still block work.
 [Open Math OS](https://os.openmathmodel.org/v1/doc/claude) gateway with your
 Open Math OS key. `--agent claude` is unchanged and keeps using your Anthropic
 account; nothing is written to `~/.claude/settings.json`. Store the key once,
-without putting it on the command line:
+without an editor and without putting it on the command line:
 
 ```sh
 install -m 600 /dev/null ~/.config/tauceti/openmathos.key
-nano ~/.config/tauceti/openmathos.key   # paste the key, save
+read -rs KEY && printf '%s\n' "$KEY" > ~/.config/tauceti/openmathos.key && unset KEY
 ```
 
-Then declare a worker, for example in `workers.toml`:
+The model has no default: the gateway's ids are opaque and may change, so set the
+exact id once, as `author_model`. List the ids with
+`curl -s -H "Authorization: Bearer $(cat ~/.config/tauceti/openmathos.key)" https://os.openmathmodel.org/claude/v1/models`.
 
 ```toml
 [[workers]]
-id = "omos-author"
+id = "openmathos-fix"
 agent = "openmathos"
-only = ["rebase", "fix-ci", "fix", "roadmap"]
-author_model = "claude-openmathos-136586835026765720304391437666977767985"  # Kimi K3.1 Pro
+only = ["rebase", "fix-ci", "fix"]
+author_model = "EXACT_GATEWAY_MODEL_ID"
+conf = "https://raw.githubusercontent.com/yuma-mizuno-lean/Mei/main/tauceti.toml"
+
+[[workers]]
+id = "openmathos-review"
+agent = "openmathos"
+only = ["review"]
+author_model = "EXACT_GATEWAY_MODEL_ID"
 conf = "https://raw.githubusercontent.com/yuma-mizuno-lean/Mei/main/tauceti.toml"
 ```
 
-The agent is unpaced, runs on the host only and never reviews, because the review
-engine would record its verdicts as Claude reviews. Each round first checks that
-the gateway lists the exact `author_model` id. `OPENMATHOS_API_KEY`,
-`OPENMATHOS_API_KEY_FILE` and `OPENMATHOS_BASE_URL` override the defaults. The
-code lives in `tauceti_worker/openmathos.py`; other files only carry short hooks
-marked `Mei fork`.
+The same model authors and reviews. Reviews go through the review engine's
+`openmathos` reviewer, which the project's `[tools.review]` pin provides (Mei pins
+`yuma-mizuno-lean/TauCetiReview`); the worker passes the model as
+`--openmathos-model`, and labels show the model the gateway reports. The worker
+reads the key file before isolating each worker's HOME and hands it on as
+`OPENMATHOS_API_KEY`; that variable, if set, wins over the file
+(`OPENMATHOS_API_KEY_FILE` names another file). The agent is unpaced and runs on
+the host only. Each round first checks that the gateway lists the exact model.
+The code lives in `tauceti_worker/openmathos.py`; other files only carry short
+hooks marked `Mei fork`.
 
 ## Keeping the fork in sync
 
@@ -87,6 +100,13 @@ patches are: dependency-cache services and multi-package cache expansion
 (`activity.py`), read-only `gh run watch` (`github_transport.py`), the OAuth
 User-Agent (`oauth.py`), the Pi OpenRouter login (`openrouter_auth.py`), and the
 Open Math OS agent.
+
+The review engine fork, `yuma-mizuno-lean/TauCetiReview`, is kept the same way:
+merge upstream `main` into the fork's `main`, run its tests, and push. Its only
+patch is the Open Math OS reviewer (`runner/openmathos.py` plus hooks marked
+`Mei fork`, and the `review_repository` input of the merge workflows). Then move
+every engine pin in Mei to the new fork commit in one PR: `[tools.review]` in
+`tauceti.toml` and the workflows that name the engine.
 
 Upstream has no declared license at the inspected base revision; this fork does
 not add or imply an Apache-2.0 license. See [GitHub's licensing guidance](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository).

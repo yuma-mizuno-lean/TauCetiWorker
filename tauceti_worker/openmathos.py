@@ -3,9 +3,16 @@
 Mei fork addition. `--agent openmathos` runs the same `claude` CLI as `--agent claude`, but every
 request goes to the Open Math OS Claude-compatible endpoint with the operator's Open Math OS key.
 It is a separate agent on purpose: `--agent claude` keeps using the operator's Anthropic
-subscription or API billing, and nothing here changes it. Like the OpenRouter and Kiro agents it is
-unpaced (Open Math OS publishes no quota telemetry the worker can read), runs on the host only, and
-never reviews: the review engine would record its verdicts as Claude reviews.
+subscription or API billing, and nothing here changes it.
+
+The model has no default. The gateway's routing ids are opaque and may change, so the exact id is
+configured once, as the worker's `author_model` (`--author-model`), and used for both authoring and
+review. Reviews go through the review engine's `openmathos` reviewer (`--openmathos-model`), which
+the project's `[tools.review]` pin must provide. Like the OpenRouter and Kiro agents it is unpaced
+(Open Math OS publishes no quota telemetry the worker can read) and runs on the host only.
+
+The key follows the OpenRouter agents: resolved before HOME isolation and handed on in the
+environment (OPENMATHOS_API_KEY), so loop children and the review engine see it after isolation.
 
 Everything provider-specific lives in this module so that merging upstream touches few lines.
 """
@@ -19,11 +26,9 @@ import urllib.request
 from pathlib import Path
 
 PROVIDER = "openmathos"
-NAME = "Open Math OS"
-# Kimi K3.1 Pro. The gateway's ids are opaque; check with openmathos.available_models().
-DEFAULT_MODEL = "claude-openmathos-136586835026765720304391437666977767985"
-DEFAULT_EFFORT = "high"
-DEFAULT_BASE_URL = "https://os.openmathmodel.org/claude"
+BASE_URL = "https://os.openmathmodel.org/claude"
+KEY_ENV = "OPENMATHOS_API_KEY"
+KEY_FILE_ENV = "OPENMATHOS_API_KEY_FILE"
 DEFAULT_KEY_FILE = "~/.config/tauceti/openmathos.key"
 
 # Claude Code picks these for its own side requests (titles, summaries, subagents). Pin them all to
@@ -38,7 +43,7 @@ _MODEL_VARIABLES = (
     "CLAUDE_CODE_SUBAGENT_MODEL",
 )
 
-_verified: set[tuple[str, str]] = set()
+_verified: set[str] = set()
 
 
 def is_openmathos(provider: str | None) -> bool:
@@ -50,63 +55,54 @@ def transcript_provider(provider: str) -> str:
     return "claude" if provider == PROVIDER else provider
 
 
-def base_url(env: dict | None = None) -> str:
-    env = os.environ if env is None else env
-    return (env.get("OPENMATHOS_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+def ensure_key() -> None:
+    """Keep an explicit OPENMATHOS_API_KEY; otherwise read the key file into it.
 
-
-def key_file(env: dict | None = None) -> Path:
-    env = os.environ if env is None else env
-    return Path(env.get("OPENMATHOS_API_KEY_FILE") or DEFAULT_KEY_FILE).expanduser()
-
-
-def api_key(env: dict | None = None) -> str:
-    """An explicit OPENMATHOS_API_KEY wins; otherwise read the 0600 key file.
-
-    A missing key does not heal by waiting, so it stops the worker (Die) rather than backing off."""
+    Called before HOME isolation, so `~` still means the operator's home. A missing key does not
+    heal by waiting, so it stops the worker rather than backing off."""
     from .config import Die
 
-    env = os.environ if env is None else env
-    key = (env.get("OPENMATHOS_API_KEY") or "").strip()
-    if not key:
-        path = key_file(env)
-        try:
-            key = path.read_text().strip()
-        except OSError:
-            raise Die(
-                f"Open Math OS key unavailable; write it to {path} (mode 0600) or set OPENMATHOS_API_KEY"
-            ) from None
+    if (os.environ.get(KEY_ENV) or "").strip():
+        return
+    path = Path(os.environ.get(KEY_FILE_ENV) or DEFAULT_KEY_FILE).expanduser()
+    try:
+        key = path.read_text().strip()
+    except OSError:
+        raise Die(f"Open Math OS key unavailable; write it to {path} (mode 0600) or set {KEY_ENV}") from None
     if not key or "\n" in key or "\r" in key:
-        raise Die("Open Math OS key must be a single line")
+        raise Die(f"Open Math OS key in {path} must be a single line")
+    os.environ[KEY_ENV] = key
+
+
+def _key(env) -> str:
+    key = (env.get(KEY_ENV) or "").strip()
+    if not key:
+        from .config import Die
+
+        raise Die(f"{KEY_ENV} is not set; the worker resolves it at start-up")
     return key
 
 
-def authoring_only(only: list[str], allowed: list[str]) -> list[str]:
-    """Restrict an Open Math OS worker to authoring phases; review is never delegated to it."""
-    if "review" in only:
-        raise RuntimeError("--agent openmathos cannot review; drop review from --only")
-    return list(only) if only else [task for task in allowed if task != "review"]
-
-
 def process_env(env: dict, model: str) -> dict:
-    """The claude process environment for one Open Math OS round."""
+    """The claude process environment for one Open Math OS authoring round."""
     env = dict(env)
+    key = _key(env)
     env.pop("ANTHROPIC_API_KEY", None)  # an Anthropic key must never reach another endpoint
     env.pop("TAUCETI_CLAUDE_BILLING", None)
-    env["ANTHROPIC_BASE_URL"] = base_url(env)
-    env["ANTHROPIC_AUTH_TOKEN"] = api_key(env)
+    env.pop(KEY_ENV, None)  # the agent gets the key only as the gateway credential below
+    env["ANTHROPIC_BASE_URL"] = BASE_URL
+    env["ANTHROPIC_AUTH_TOKEN"] = key
     for name in _MODEL_VARIABLES:
         env[name] = model
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-    env.pop("OPENMATHOS_API_KEY", None)
     return env
 
 
-def available_models(env: dict | None = None, timeout: float = 20) -> list[str]:
+def available_models(timeout: float = 20) -> list[str]:
     request = urllib.request.Request(
-        base_url(env) + "/v1/models",
+        BASE_URL + "/v1/models",
         headers={
-            "Authorization": "Bearer " + api_key(env),
+            "Authorization": "Bearer " + _key(os.environ),
             "Accept": "application/json",
             "User-Agent": "tauceti-worker",
         },
@@ -117,13 +113,12 @@ def available_models(env: dict | None = None, timeout: float = 20) -> list[str]:
     return [row["id"] for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)]
 
 
-def ensure_model(model: str, env: dict | None = None) -> None:
+def ensure_model(model: str) -> None:
     """Refuse to launch unless the gateway lists this exact model id (no silent substitution)."""
-    marker = (base_url(env), model)
-    if marker in _verified:
+    if model in _verified:
         return
     try:
-        models = available_models(env)
+        models = available_models()
     except urllib.error.HTTPError as error:
         raise RuntimeError(f"Open Math OS model list failed: HTTP {error.code}") from None
     except (OSError, ValueError) as error:
@@ -132,4 +127,14 @@ def ensure_model(model: str, env: dict | None = None) -> None:
         raise RuntimeError(
             f"Open Math OS does not list exact model {model!r}; available: {', '.join(sorted(models)) or 'none'}"
         )
-    _verified.add(marker)
+    _verified.add(model)
+
+
+def review_model(reviewers: str) -> str | None:
+    """The exact model for the review engine's openmathos reviewer: the worker's own configured
+    model, resolved like any authoring profile (as _kiro_review_model does for Kiro)."""
+    if PROVIDER not in [r.strip() for r in reviewers.split(",")]:
+        return None
+    from .agents import resolve_authoring_profile
+
+    return resolve_authoring_profile(PROVIDER).model

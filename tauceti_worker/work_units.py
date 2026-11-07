@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import openmathos  # Mei fork
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
@@ -902,7 +903,7 @@ def _host_agent_binary(stage: str, model: str) -> str | None:
     if stage == "review":
         if model in OPENROUTER_MODELS:
             return "pi"
-        return {"codex": "codex", "claude": "claude", "kiro": "kiro-cli"}.get(model)
+        return {"codex": "codex", "claude": "claude", "kiro": "kiro-cli", "openmathos": "claude"}.get(model)
     argv, _ = host_agent_argv("", model)
     return argv[0] if argv else None
 
@@ -1436,6 +1437,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
             claude_model = _claude_review_model(reviewers)
             km = _kiro_review_model(reviewers)
+            om = openmathos.review_model(reviewers)  # Mei fork
             from .retention import review_workspace
 
             with review_workspace(w.cfg) as scratch:
@@ -1463,6 +1465,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                         *(["--claude-model", claude_model] if claude_model else []),
                         *(["--codex-model", cm] if cm else []),
                         *(["--kiro-model", km] if km else []),
+                        *(["--openmathos-model", om] if om else []),
                     ],
                     logf,
                     f"review #{pr}",
