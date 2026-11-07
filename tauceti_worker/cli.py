@@ -1394,6 +1394,15 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         wid = auto_assign_wid()
         os.environ["TAUCETI_WORKER_ID"] = wid
         log(f"auto-assigned worker slot {wid} (override with --worker-id)")
+    # Resolve Pi's OpenRouter login before HOME isolation. An explicit environment
+    # key always wins; never put a credential in worker configuration or logs.
+    if agent in OPENROUTER_MODELS and not getattr(args, "dry_run", False):
+        from .openrouter_auth import ensure_openrouter_key
+
+        try:
+            ensure_openrouter_key()
+        except RuntimeError as error:
+            raise Die(str(error)) from None
     # A distinct worker id implies its own credential directories (so several workers' refreshes don't
     # race); --isolate-home forces it even for the 'default' id. This must run BEFORE Config.resolve so
     # cfg.home and the credential paths derived from it point at the per-worker copy. Off macOS that

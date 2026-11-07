@@ -72,7 +72,9 @@ assert "ANTHROPIC_API_KEY" not in env, "claude env must drop ANTHROPIC_API_KEY (
 print("[OK ] claude env drops ANTHROPIC_API_KEY")
 
 a, env = tc.host_agent_argv(P, "deepseek")
-check("deepseek", a, [tc.PI_RUN, "openrouter", tc.OPENROUTER_MODELS["deepseek"], "--prompt", P])
+check(
+    "deepseek", a, ["pi", "--provider", "openrouter", "--model", tc.OPENROUTER_MODELS["deepseek"], "--print", "--", P]
+)
 
 # A prompt longer than one argv string may be (Linux: MAX_ARG_STRLEN, 128 KiB) leaves argv for stdin:
 # `claude -p` with no prompt argument and `codex exec ... -` both read the whole of stdin.

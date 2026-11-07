@@ -866,7 +866,10 @@ def host_agent_argv(
             argv += ["--effort", profile.effort]
         argv += [prompt]
     elif profile.provider in OPENROUTER_MODELS:
-        argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
+        if PI_RUN:
+            argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
+        else:
+            argv = ["pi", "--provider", "openrouter", "--model", profile.model, "--print", "--", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
         # The one exception is a launcher that bills the API with the key in its own environment and
         # no accounting shim (the queue's repair task, `TAUCETI_CLAUDE_BILLING=api` without
@@ -979,6 +982,13 @@ def run_agent_host(
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
     _LAST_AGENT_FAILURE = None
+    if profile.provider in OPENROUTER_MODELS and not PI_RUN:
+        from .openrouter_auth import ensure_pi_model
+
+        try:
+            ensure_pi_model(profile.model, env)
+        except RuntimeError as error:
+            raise AgentLaunchUnavailable(str(error)) from None
     with host_build_cache_context(cwd, env, logdir) as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
@@ -2983,10 +2993,8 @@ def share_build_caches(wid: str, data_home: Path) -> dict[str, str]:
 # the isolated config dir as before: none of it reaches a prompt.
 _MIRRORED_TOOLING = ("swap-account", "bin", "config.json")
 
-# The one skill the worker itself dispatches through: $PI_RUN defaults to
-# ~/.claude/skills/pi/scripts/run.sh, and in a loop child `~` is already the isolated home, so the
-# OpenRouter agents need this path to resolve. Symlinked individually rather than by exposing the
-# whole skills dir.
+# Preserve the legacy Pi skill for operators who explicitly use a PI_RUN wrapper.
+# Symlink it individually rather than exposing the whole skills directory.
 _WORKER_SKILL = "pi"
 
 # What the isolated config dir gets instead of the operator's settings.json. Only the settings that
@@ -3053,8 +3061,7 @@ def seed_worker_claude_config(real_claude: Path | None, iso_claude: Path) -> Non
 
     This is the same clean-room the review engine already builds for a reviewer, and for the same
     stated reason: seed the credential, not the personality. Tooling the worker itself shells out to
-    is still symlinked (none of it reaches a prompt), and so is the single `pi` skill $PI_RUN
-    resolves through.
+    is still symlinked (none of it reaches a prompt), as is the legacy `pi` skill.
 
     Idempotent, and safe to call on both isolate_home paths — which it must be, because a round child
     of a loop parent started before this code exists reaches only the early-return one, and would

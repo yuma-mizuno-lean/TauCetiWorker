@@ -266,7 +266,7 @@ AUTHORING_DEFAULTS = {
     "kiro": ("gpt-5.6-sol", "high"),
 }
 
-PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/scripts/run.sh"))
+PI_RUN = os.environ.get("PI_RUN", "")  # Optional legacy wrapper; otherwise launch pi directly.
 
 # $TAUCETI_CLAUDE_CMD overrides the `claude` executable for host rounds (a sandbox wrapper, a
 # differently-named build, ...); it's split as a shell word list and the standard
