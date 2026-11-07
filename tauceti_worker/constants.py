@@ -266,7 +266,7 @@ AUTHORING_DEFAULTS = {
     # Kiro does not serve gpt-6-sol yet (https://kiro.dev/changelog/models/).
     "kiro": ("gpt-5.6-sol", "high"),
     # Mei fork: Claude Code against the Open Math OS gateway; see openmathos.py.
-    "openmathos": ("claude-openmathos-k3", "high"),
+    "openmathos": ("claude-openmathos-136586835026765720304391437666977767985", "high"),  # Kimi K3.1 Pro
 }
 
 PI_RUN = os.environ.get("PI_RUN", "")  # Optional legacy wrapper; otherwise launch pi directly.

@@ -87,17 +87,21 @@ with tempfile.TemporaryDirectory() as tmp:
 
     with patch.dict(os.environ, base, clear=True):
         openmathos._verified.clear()
-        with patch("urllib.request.urlopen", listing("claude-openmathos-k3-preview")):
+        with patch(
+            "urllib.request.urlopen", listing("claude-openmathos-136586835026765720304391437666977767985-preview")
+        ):
             try:
-                openmathos.ensure_model("claude-openmathos-k3")
+                openmathos.ensure_model("claude-openmathos-136586835026765720304391437666977767985")
             except RuntimeError as error:
                 assert "exact" in str(error) and "omos-secret" not in str(error)
             else:
                 raise AssertionError("a near match must not be accepted")
-        with patch("urllib.request.urlopen", listing("claude-openmathos-k3")) as urlopen:
-            openmathos.ensure_model("claude-openmathos-k3")
-            openmathos.ensure_model("claude-openmathos-k3")
+        with patch(
+            "urllib.request.urlopen", listing("claude-openmathos-136586835026765720304391437666977767985")
+        ) as urlopen:
+            openmathos.ensure_model("claude-openmathos-136586835026765720304391437666977767985")
+            openmathos.ensure_model("claude-openmathos-136586835026765720304391437666977767985")
         with patch("urllib.request.urlopen", side_effect=AssertionError("cached")):
-            openmathos.ensure_model("claude-openmathos-k3")
+            openmathos.ensure_model("claude-openmathos-136586835026765720304391437666977767985")
 
 print("Open Math OS agent: OK")

@@ -49,7 +49,7 @@ Then declare a worker, for example in `workers.toml`:
 id = "omos-author"
 agent = "openmathos"
 only = ["rebase", "fix-ci", "fix", "roadmap"]
-author_model = "claude-openmathos-k3"
+author_model = "claude-openmathos-136586835026765720304391437666977767985"  # Kimi K3.1 Pro
 conf = "https://raw.githubusercontent.com/yuma-mizuno-lean/Mei/main/tauceti.toml"
 ```
 

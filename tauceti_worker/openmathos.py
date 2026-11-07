@@ -20,7 +20,8 @@ from pathlib import Path
 
 PROVIDER = "openmathos"
 NAME = "Open Math OS"
-DEFAULT_MODEL = "claude-openmathos-k3"
+# Kimi K3.1 Pro. The gateway's ids are opaque; check with openmathos.available_models().
+DEFAULT_MODEL = "claude-openmathos-136586835026765720304391437666977767985"
 DEFAULT_EFFORT = "high"
 DEFAULT_BASE_URL = "https://os.openmathmodel.org/claude"
 DEFAULT_KEY_FILE = "~/.config/tauceti/openmathos.key"
