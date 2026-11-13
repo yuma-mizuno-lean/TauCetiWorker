@@ -244,6 +244,7 @@ AGENT_NAMES = {
     "kiro": "Kiro",
     "deepseek": "DeepSeek",
     "minimax": "MiniMax",
+    "openmathos": "Open Math OS",
 }
 
 # Reproducible authoring defaults. Provider selection remains quota-driven; once
@@ -264,6 +265,7 @@ AUTHORING_DEFAULTS = {
     # id (for example claude-opus-5) with the existing --author-model flag.
     # Kiro does not serve gpt-6-sol yet (https://kiro.dev/changelog/models/).
     "kiro": ("gpt-5.6-sol", "high"),
+    "openmathos": (None, "high"),  # The gateway requires a configured exact model ID.
 }
 
 PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/scripts/run.sh"))
@@ -323,4 +325,4 @@ SANDBOX_DEFAULT["progress"] = False
 SANDBOX_DEFAULT["overlap-scan"] = False  # host investigation; publication stays outside the model
 
 
-AGENTS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax"]
+AGENTS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax", "openmathos"]

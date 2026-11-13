@@ -89,6 +89,7 @@ from .cost_model import analyze_review_archive, infrastructure_model, loc_cost_m
 from .cost_model import format_report as format_cost_report
 from .github import GitHub, pin_github_account, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
+from .openmathos import TASKS as OPENMATHOS_TASKS
 from .paths import HERE, ensure_ssl_cert_file, legacy_data_root
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
 from .review_state import ReviewState
@@ -279,7 +280,8 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         default=None,
         help="which agent to run: auto (Codex preferred, Opus fallback), codex, claude, "
         "kiro (exact model, subscription credits), or deepseek/minimax (pay-per-token "
-        "OpenRouter). Kiro/OpenRouter are explicit-only and unpaced "
+        "OpenRouter), or openmathos (Open Math OS for host authoring and repair). "
+        "Kiro/OpenRouter/Open Math OS are explicit-only and unpaced "
         "(default: $TAUCETI_AGENT or auto)",
     )
     p.add_argument(
@@ -1043,8 +1045,13 @@ def main(argv: list[str] | None = None) -> int:
     if cmd in ("work", "_round"):
         only = resolve_tasks(getattr(args, "only", []), getattr(args, "skip", []))
         prs = resolve_pr_targets(getattr(args, "pr", []))
-        raise_on_untargetable_tasks(prs, only)
         agent = resolve_agent(args)
+        if agent == "openmathos":
+            if not getattr(args, "only", []):
+                only = [task for task in (only or OPENMATHOS_TASKS) if task in OPENMATHOS_TASKS]
+            if not only or set(only) - set(OPENMATHOS_TASKS):
+                raise Die("--agent openmathos only supports " + ", ".join(OPENMATHOS_TASKS))
+        raise_on_untargetable_tasks(prs, only)
         # --account names a CODEX account, so the round must be committed to Codex before it starts.
         # Under `auto` the pacer may legitimately land on Claude, and there is no honest answer then:
         # silently ignoring the flag would spend on an account the operator did not authorise, and
@@ -1354,6 +1361,15 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     resolved_author_fallback_model = getattr(args, "resolved_author_fallback_model", None)
     if (author_model or author_effort) and agent == "auto":
         raise Die("--author-model/--author-effort require an explicit --agent; auto may choose another provider")
+    if agent == "openmathos":
+        from .openmathos import ensure_key
+
+        if getattr(args, "bubble", False):
+            raise Die("--agent openmathos runs on the host only")
+        profile = resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
+        os.environ["TAUCETI_AUTHORING_OPENMATHOS_MODEL"] = profile.model
+        if not getattr(args, "dry_run", False):
+            ensure_key()
     if author_effort and agent in OPENROUTER_MODELS:
         raise Die(f"--author-effort is not supported for the OpenRouter provider {agent!r}")
     # --roadmap-only overrides the env for this run (and is inherited by loop children, which read it

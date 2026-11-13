@@ -70,7 +70,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
     round and exits. Keeps the escalating back-off that stopped ~700 no-op rounds hammering a
     rate-limited GitHub."""
-    unpaced = agent in OPENROUTER_MODELS or agent == "kiro" or api_mode()
+    unpaced = agent in OPENROUTER_MODELS or agent in ("kiro", "openmathos") or api_mode()
     ignore_quota = getattr(args, "ignore_quota", False)
     bubble = getattr(args, "bubble", False)
     quota_cmd = getattr(args, "quota_cmd", None)
@@ -554,7 +554,7 @@ def resolve_work_model(
     `already_paced` carries only the parent's soft pacing decision, never outage permission."""
     if dry:
         return agent
-    if agent in OPENROUTER_MODELS or agent == "kiro":
+    if agent in OPENROUTER_MODELS or agent in ("kiro", "openmathos"):
         return agent
     if ignore_quota and not quota_cmd and agent == "auto":
         raise SystemExit(

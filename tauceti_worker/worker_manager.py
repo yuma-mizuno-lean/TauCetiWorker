@@ -33,6 +33,7 @@ from . import worker_scopes
 from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
 from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
+from .openmathos import TASKS as OPENMATHOS_TASKS
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
 from .round import signal_group
@@ -377,6 +378,11 @@ class WorkerSpec:
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
         if (spec.author_model or spec.author_effort) and spec.agent == "auto":
             raise WorkersError(f"workers[{index}] author_model/author_effort require an explicit agent")
+        if spec.agent == "openmathos":
+            if spec.sandbox != "host":
+                raise WorkersError(f"workers[{index}]: Open Math OS runs on the host only")
+            if set(spec.only) - set(OPENMATHOS_TASKS):
+                raise WorkersError(f"workers[{index}]: Open Math OS only supports " + ", ".join(OPENMATHOS_TASKS))
         if spec.claude_billing not in ("subscription", "api"):
             raise WorkersError("claude_billing must be subscription or api")
         if spec.claude_billing == "api":

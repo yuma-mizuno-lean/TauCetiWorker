@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # annotations only; importing at runtime would invert the layer order
     from .work_units import RoundOpts, Worker
 
-from . import build_caches
+from . import build_caches, openmathos
 from .config import Config, Die, NoProgress, log
 from .constants import (
     AUTHORING_DEFAULTS,
@@ -142,7 +142,7 @@ def resolve_authoring_profile(
         effort, effort_source = default_effort, "repository default"
 
     if not model:
-        raise Die(f"authoring model for {provider} must not be empty")
+        raise Die(f"authoring model for {provider} must be set with --author-model or ${model_env}")
     if provider == "kiro":
         _validate_kiro_model_pin(model, model_source)
     elif provider == "claude":
@@ -866,7 +866,7 @@ PROMPT_ARGV_LIMIT = 64 * 1024
 
 # Providers whose CLI reads the prompt from stdin when the positional prompt is absent (`claude -p`
 # with no prompt argument) or is `-` (`codex exec -`). Kiro and the Pi runner only take argv.
-_STDIN_PROMPT_PROVIDERS = frozenset({"claude", "codex"})
+_STDIN_PROMPT_PROVIDERS = frozenset({"claude", "codex", "openmathos"})
 
 
 def prompt_on_stdin(prompt: str, profile: AuthoringProfile | str) -> bool:
@@ -931,6 +931,8 @@ def host_agent_argv(
         # already removed it from the environment (claude_api.configure_api).
         if not (env.get("TAUCETI_CLAUDE_BILLING") == "api" and not os.environ.get("TAUCETI_API_CONTEXT")):
             env.pop("ANTHROPIC_API_KEY", None)
+        if openmathos.is_openmathos(profile.provider):
+            env = openmathos.process_env(env, profile.model)
         command = (
             os.environ.get("TAUCETI_CLAUDE_CMD", CLAUDE_CMD) if os.environ.get("TAUCETI_API_CONTEXT") else CLAUDE_CMD
         )
@@ -1000,7 +1002,7 @@ def run_agent_host(
             if profile.effort:
                 argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
             argv += [resume, "-" if stdin_text is not None else prompt]
-        elif profile.provider == "claude":
+        elif openmathos.transcript_provider(profile.provider) == "claude":
             argv += ["--resume", resume]
     if env.get("TAUCETI_RECOVERY_CONTINUATION") == "1":
         env.pop("GH_TOKEN", None)
@@ -1036,6 +1038,11 @@ def run_agent_host(
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
     _LAST_AGENT_FAILURE = None
+    if openmathos.is_openmathos(profile.provider):
+        try:
+            openmathos.ensure_model(profile.model)
+        except RuntimeError as error:
+            raise AgentLaunchUnavailable(str(error)) from None
     with host_build_cache_context(cwd, env, logdir) as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
@@ -1216,7 +1223,7 @@ def run_agent_proc(
     # of stdin. Otherwise close stdin explicitly: Bubble reaches the agent through a non-PTY SSH
     # channel, so an inherited terminal becomes a non-TTY stream there; Codex then treats it as
     # additional prompt input and waits forever for EOF.
-    renderer = AgentTranscriptRenderer(provider)
+    renderer = AgentTranscriptRenderer(openmathos.transcript_provider(provider))
     quota_reader, launch_credential = None, None
     if (
         quota_cfg is not None
@@ -1349,7 +1356,7 @@ def run_agent_proc(
             "usage": dict(renderer.usage),
             "tail": list(tail)[-6:],  # the guardian's fixed diagnostic when the executable cannot start
         }
-        if provider in {"codex", "claude"} and not renderer.active:
+        if renderer.provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
         return rc
 
@@ -1357,7 +1364,7 @@ def run_agent_proc(
         # A refund asserts that the agent never ran. Structured work events are stronger evidence
         # than transcript length, while a final structured provider diagnostic is stronger evidence
         # than Bubble prelude lines. A retry event alone is deliberately not terminal evidence.
-        if provider in {"codex", "claude"} and renderer.saw_work:
+        if renderer.provider in {"codex", "claude"} and renderer.saw_work:
             return None
         classification_text = "\n".join(tail)
         if renderer.terminal_failure_final and renderer.terminal_failure_text:

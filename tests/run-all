@@ -82,6 +82,7 @@ RUN_STDLIB=(
   automatic_bump.py
   bump_attestation.py
   authoring_profiles.py
+  openmathos.py
   bubble_cache.py
   bubble_version.py
   branch_claim_repo.py
