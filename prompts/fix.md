@@ -1,5 +1,10 @@
 You are addressing AI code review on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. Work autonomously to completion.
 
+## Repair scope
+Read existing reviews as needed, make the repair, and run the local checks below. You may push verified changes and reply to existing findings where the task calls for it.
+
+Do not start or request a review of this PR. Do not invoke `tauceti-review`, Codex, Claude, or another reviewer to judge this PR, including through a shell, script, subprocess, or subagent. Do not submit review verdicts, approvals, or scoreboards through the CLI, GitHub, or its API. After pushing, leave re-review to a separate reviewer.
+
 ## Read the review
 - The review is posted as a sticky scoreboard comment plus one thread per flagged rubric. Read them:
   - `gh pr view __PR__ --repo TauCetiProject/TauCeti --json comments`

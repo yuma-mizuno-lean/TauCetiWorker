@@ -1,5 +1,10 @@
 You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The `build` check is red. Work autonomously to completion: make CI green without weakening the PR.
 
+## Repair scope
+Read existing reviews as needed, make the repair, and run the local checks below. You may push verified changes and reply to existing findings where the task calls for it.
+
+Do not start or request a review of this PR. Do not invoke `tauceti-review`, Codex, Claude, or another reviewer to judge this PR, including through a shell, script, subprocess, or subagent. Do not submit review verdicts, approvals, or scoreboards through the CLI, GitHub, or its API. After pushing, leave re-review to a separate reviewer.
+
 ## Find out what's actually failing
 - See which checks failed and read their logs:
   - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
