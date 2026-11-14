@@ -1532,6 +1532,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
         from . import expanded_cache, shared_mathlib
 
+        materialize_dependencies(cwd, env, logdir)
         report = {}
         mathlib_started = expanded_cache.clock()
         try:
@@ -1555,6 +1556,48 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             raise BuildCacheUnavailable(
                 f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
             ) from error
+
+
+def materialize_dependencies(cwd: Path, env: dict, logdir: Path, timeout: float = 900) -> None:
+    """Clone missing dependency sources before shared Mathlib is chosen.
+
+    `shared_mathlib.view()` can only share a Mathlib build once `.lake/packages/mathlib` exists. In
+    a fresh checkout it did not, so the round chose a private build and `lake cache get` then unpacked
+    a full private copy of Mathlib's outputs. Lake's ordinary workspace load clones the manifest's
+    package sources (tens of seconds, no builds, no cache downloads), which is what `cache get`
+    would have done anyway, only later. Failure is not fatal here: the view reports why it cannot
+    share."""
+    from . import processes
+
+    try:
+        manifest = json.loads((cwd / "lake-manifest.json").read_text())
+    except (OSError, ValueError):
+        return
+    packages = manifest.get("packages") if isinstance(manifest, dict) else None
+    if not isinstance(packages, list):
+        return  # malformed manifests reach the ordinary workspace-error and repair paths
+    names = {p["name"] for p in packages if isinstance(p, dict) and isinstance(p.get("name"), str)}
+    if "mathlib" not in names or (cwd / ".lake/packages/mathlib").is_dir():
+        return
+    logdir.mkdir(parents=True, exist_ok=True)
+    quiet = {**env, "GIT_TERMINAL_PROMPT": "0"}  # Git can prompt through /dev/tty despite null stdin
+    with open(logdir / "materialize-dependencies.log", "ab") as output:
+        try:
+            # The owned process group takes Lake's Git and SSH children with it on timeout.
+            result = processes.run(
+                ["lake", "env", "true"],
+                cwd=cwd,
+                env=quiet,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            log(f"dependencies: could not materialize Mathlib before sharing ({error})")
+            return
+    if result.returncode:
+        log(f"dependencies: lake env exited {result.returncode}; shared Mathlib may be skipped")
 
 
 def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:
@@ -3071,8 +3114,9 @@ _WORKER_SKILL = "pi"
 # from host_agent_argv, so they are deliberately absent rather than a second source of truth.
 _WORKER_CLAUDE_SETTINGS = {
     # The isolated .claude/projects/*.jsonl is the only per-turn record of what a claude round did;
-    # the worker's own logs/agent-*.log is a rendered summary. Keep both.
-    "cleanupPeriodDays": 36500,
+    # the worker's own logs/agent-*.log is a rendered summary. Keep a month of transcripts
+    # (retention.TRANSCRIPT_LIFETIME, which also bounds Codex sessions): unbounded, they filled disks.
+    "cleanupPeriodDays": 30,
     "permissions": {"defaultMode": "bypassPermissions"},
     # An unattended round has no one to show an artifact to, and publishing one is outward-facing.
     "enableArtifact": False,
@@ -3084,6 +3128,9 @@ _WORKER_CLAUDE_SETTINGS = {
     # production.
     "skipDangerousModePermissionPrompt": True,
 }
+# Earlier generated versions. A settings.json still exactly equal to one of them was never edited
+# by the operator, so it is upgraded in place (and discarded like the current one).
+_PREVIOUS_WORKER_CLAUDE_SETTINGS = ({**_WORKER_CLAUDE_SETTINGS, "cleanupPeriodDays": 36500},)
 
 
 def _config_sources(real_claude: Path | None, iso_claude: Path) -> tuple[Path, ...]:
@@ -3188,9 +3235,15 @@ def seed_worker_claude_config(real_claude: Path | None, iso_claude: Path) -> Non
         except OSError:
             pass
 
-    # Written once, so an operator can tune a worker by editing it in place.
+    # Written once, so an operator can tune a worker by editing it in place; a file still exactly
+    # as an earlier version generated it is brought up to date.
     settings = iso_claude / "settings.json"
-    if not settings.exists() and not settings.is_symlink():
+    try:
+        stale = settings.is_file() and not settings.is_symlink()
+        stale = stale and json.loads(settings.read_text()) in _PREVIOUS_WORKER_CLAUDE_SETTINGS
+    except (OSError, ValueError):
+        stale = False
+    if stale or (not settings.exists() and not settings.is_symlink()):
         try:
             _write_json_atomic(settings, _WORKER_CLAUDE_SETTINGS)
         except OSError:
@@ -3206,7 +3259,7 @@ def _discard_generated(iso_claude: Path) -> None:
     settings = iso_claude / "settings.json"
     try:
         if settings.is_file() and not settings.is_symlink():
-            if json.loads(settings.read_text()) == _WORKER_CLAUDE_SETTINGS:
+            if json.loads(settings.read_text()) in (_WORKER_CLAUDE_SETTINGS, *_PREVIOUS_WORKER_CLAUDE_SETTINGS):
                 settings.unlink()
     except (OSError, ValueError):
         pass
