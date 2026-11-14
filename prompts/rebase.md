@@ -1,10 +1,5 @@
 You are reconciling the branch with current main on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The branch either conflicts with current `main`, or an authenticated head-bound recovery request asks for integration repair. A build-green, textually mergeable branch can still import source deleted or moved on main, use renamed APIs, or duplicate declarations now on main. Read the exact request evidence below; a suspect partition containing several PRs is not evidence against this PR. Integrate main and repair the resulting source so it can merge again. Work autonomously to completion.
 
-## Repair scope
-Read existing reviews as needed, make the repair, and run the local checks below. You may push verified changes and reply to existing findings where the task calls for it.
-
-Do not start or request a review of this PR. Do not invoke `tauceti-review`, Codex, Claude, or another reviewer to judge this PR, including through a shell, script, subprocess, or subagent. Do not submit review verdicts, approvals, or scoreboards through the CLI, GitHub, or its API. After pushing, leave re-review to a separate reviewer.
-
 Before editing and again before pushing, re-read the live PR: it must remain open at the starting head with no `keep`/`hold`/`wip`/`human`/`on-hold`/`do-not-close` pause. For a semantic handoff, confirm its authenticated current-head request is still active. If it was withdrawn or superseded, stop without changing the branch.
 
 ## Rebase onto current main
