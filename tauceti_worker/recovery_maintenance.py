@@ -252,38 +252,6 @@ def _cleanup_cache_tree(state, tree, registry, work, observation):
             atomic_json(job_path, job)
 
 
-def _referenced(state, tree):
-    """Honor pending verification references with the same ordinary housekeeping budget."""
-    from .work_recovery import _charge
-
-    targets = {tree.resolve()}
-    if tree.name.endswith(".deleting"):
-        targets.add(tree.with_name(tree.name.removesuffix(".deleting")).resolve())
-    for source in (state, state / "verification-state"):
-        directory = source / "verification-pending"
-        if not directory.is_dir():
-            continue
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                _charge(entries=1)
-                if entry.name.startswith(".") or not entry.name.endswith(".json"):
-                    continue  # interrupted atomic writes never became pending jobs
-                job = _metadata(Path(entry.path))
-                if not job:
-                    return True  # malformed reference withholds only this destructive candidate
-                for key in ("lease", "receipt", "lint_modules", "root"):
-                    value = job.get(key)
-                    if isinstance(value, str):
-                        reference = Path(value)
-                        if reference.is_relative_to("/opt/verification-state"):
-                            reference = source / reference.relative_to("/opt/verification-state")
-                        if not reference.is_absolute():
-                            reference = source / reference
-                        if any(reference.resolve().is_relative_to(target) for target in targets):
-                            return True
-    return False
-
-
 def _safe(state, tree, owner, *, locked=False):
     with completed_check():
         return _safe_once(state, tree, owner, locked=locked)
@@ -296,8 +264,6 @@ def _safe_once(state, tree, owner, *, locked=False):
     birth = owner.get("process") if isinstance(owner, dict) else None
     if not wr.owner_stopped(birth):
         return "await-owner"
-    if _referenced(state, tree):
-        return "await-verification-reference"
     try:
         session = wr.owner_session(birth)
     except (OSError, ValueError, KeyError, IndexError):
@@ -581,35 +547,57 @@ def _unarchived_state(tree, snap):
     """v1 captures branch source, but not credentials, native operations or extra Git history."""
     from . import work_recovery as wr
 
-    if not (tree / ".git").is_dir() or (tree / ".git").is_symlink():
+    if wr.checkout_kind(tree) is None:
         return True
     if snap.operations or any("credential" in reason for _, reason in snap.excluded):
         return True
-    if wr._git(tree, "for-each-ref", "--format=%(refname)", "refs/stash", "refs/notes").strip():
+    extra = ["refs/stash", "refs/notes"] + (
+        ["refs/worktree", "refs/bisect"] if wr.checkout_kind(tree) == "worktree" else []
+    )
+    if wr._git(tree, "for-each-ref", "--format=%(refname)", *extra).strip():
         return True
     # The history-aware snapshot includes extra ref/reflog tips in this descriptor's v1 bundle.
     return False
+
+
+def _metadata_dirs(tree):
+    """`(gitdir, common)` read from the files Git writes, without starting Git.
+
+    A linked worktree's `.git` file names its own directory, whose `commondir` names the shared
+    repository; an ordinary clone's `.git` directory is both.
+    """
+    dotgit = tree / ".git"
+    try:
+        if dotgit.is_file() and not dotgit.is_symlink():
+            gitdir = (tree / dotgit.read_text().strip().removeprefix("gitdir: ")).resolve()
+            common = gitdir / (gitdir / "commondir").read_text().strip()
+            return gitdir, common.resolve()
+    except OSError:
+        pass
+    return dotgit, dotgit
 
 
 def _park_signature(tree, sidecar):
     """Constant-size metadata probe; no traversal of parked source or historical payloads."""
     from .work_recovery import _charge
 
+    gitdir, common = _metadata_dirs(tree)
     paths = [
         tree,
         sidecar,
+        gitdir,
+        gitdir / "HEAD",
+        gitdir / "logs/HEAD",
         *(
-            tree / ".git" / name
+            common / name
             for name in (
                 "",
-                "HEAD",
                 "packed-refs",
                 "refs",
                 "refs/tags",
                 "refs/notes",
                 "refs/stash",
                 "logs",
-                "logs/HEAD",
                 "refs/heads",
                 "logs/refs",
                 "info/exclude",
@@ -706,7 +694,7 @@ def _cleanup(state, tree, root, work, observation=None):
             job["retry_at"] = 0  # a metadata change can retry immediately at its last successful allowance
         # Reject failed/incomplete repositories before any process or mount traversal.
         if job["phase"] == "save" or not tree.name.endswith(".deleting"):
-            valid = (tree / ".git").is_dir() and not (tree / ".git").is_symlink()
+            valid = wr.checkout_kind(tree) is not None
             if valid:
                 try:
                     with completed_check():
@@ -869,7 +857,7 @@ def abandon_incomplete(state, record):
             return None
         # Fresh process/mount/reference checks also protect pre-lease saves and stragglers.
         with completed_check():
-            if _referenced(state, record) or wr.live_users(record):
+            if wr.live_users(record):
                 return None
             mounts = retention.mount_points()
             if mounts is None:
