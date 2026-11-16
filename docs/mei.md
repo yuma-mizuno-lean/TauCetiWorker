@@ -1,6 +1,6 @@
 # Mei setup
 
-This fork adds configured dependency-cache retrieval, shared cache reuse, and
+The `mei` branch adds configured dependency-cache retrieval, shared cache reuse, and
 worker reliability fixes to [upstream](https://github.com/TauCetiProject/TauCetiWorker).
 Use Linux or WSL with `uv`, `git`, `gh`, `jq`, `elan`/`lake`, and your chosen agent CLI.
 Authenticate GitHub and the agent with your own accounts.
@@ -8,7 +8,7 @@ Authenticate GitHub and the agent with your own accounts.
 ```sh
 gh auth login
 codex login
-uv tool install git+https://github.com/yuma-mizuno-lean/TauCetiWorker@main
+uv tool install git+https://github.com/yuma-mizuno-lean/TauCetiWorker@mei
 tauceti --conf https://raw.githubusercontent.com/yuma-mizuno-lean/Mei/main/tauceti.toml doctor
 ```
 
@@ -75,22 +75,29 @@ hooks marked `Mei fork`.
 
 ## Keeping the fork in sync
 
-`main` is upstream `main` plus the Mei patches, joined by merge commits. Never
-rebase or force-push it. To take a new upstream:
+The fork's `main` mirrors upstream `main`. The `mei` branch carries the Mei
+patches and takes upstream changes through merge commits. To update `mei`:
 
 ```sh
 git fetch origin && git fetch fork
-git worktree add -b sync/upstream-$(date +%Y%m%d) ../tw-sync fork/main
+git worktree add -b sync/upstream-$(date +%Y%m%d) ../tw-sync fork/mei
 cd ../tw-sync && git merge origin/main     # resolve, keeping the fork's reduced CI
 ./tests/run-all -j "$(nproc)"
-git push fork HEAD:main                    # fast-forward only
+git push fork HEAD:mei                    # fast-forward only
 ```
 
-The operator checkout runs `fork/main` itself. Stop the manager, update it and restart:
+If the local Mei branch still tracks `fork/main`, switch its tracking branch once:
+
+```sh
+git -C ~/TauCetiWorker fetch fork
+git -C ~/TauCetiWorker branch --set-upstream-to=fork/mei codex/mei-fork-runtime
+```
+
+To update the operator checkout, stop the manager, pull `fork/mei`, and restart:
 
 ```sh
 tauceti workers manager-stop
-git -C ~/TauCetiWorker pull --ff-only fork main
+git -C ~/TauCetiWorker pull --ff-only fork mei
 tauceti workers apply
 ```
 
