@@ -629,7 +629,8 @@ tauceti workers logs --follow reviewer     # its durable console log
 there, `enable`, `disable`, `restart`, and `remove` adjust one worker each. The
 manager validates the whole file before applying it, starts missing enabled
 workers, gracefully stops disabled or removed ones, restarts only definitions
-that changed, and backs off repeated failures.
+that changed, and backs off repeated failures. Restarts wait for the worker's
+current round to finish; see [rolling deploys](docs/workers.md#restarts-and-rolling-deploys).
 
 For fields that `add` does not expose, run `tauceti workers edit`, validate with
 `tauceti workers apply --check`, then apply. Editing while the manager runs is
@@ -780,8 +781,6 @@ in `workers.toml`. Keep the raw API key out of that file.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
-- [Unfinished source recovery](docs/work-recovery.md): records saved before
-  checkout preparation resets, and checkouts moved aside while still in use.
 
 The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
 adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)
@@ -806,4 +805,6 @@ Request diagnostics include JSON field names and distinguish closed-PR history
 scans from open inventories. Progress batches complete labelled histories with
 independent cursors rather than caching a potentially incomplete reporting window.
 
-Use `tauceti work --self-tested` (or `self_tested = true` in a worker definition) to instruct source-changing agents to apply the `self-tested` label to eligible mathematics PRs after successful local verification. The existing shared checks cover `lake build --iofail && lake test && lake lint`; no additional verification pass is needed. Use `--no-self-tested` to disable the prompting. Reviews and staging tests remain required.
+Use `tauceti work --self-tested` (or `self_tested = true` in a worker definition) to instruct source-changing agents to apply the `self-tested` label to eligible mathematics PRs after successful local verification. The existing shared checks cover `lake build --iofail && lake test && lake lint`; no additional verification pass is needed. Use `--no-self-tested` to disable the prompting. If direct labelling lacks permission, agents can request the label with a new standalone `self-tested` PR comment; only the PR author can use that command, and it declares that the author runs local verification. The label persists through fix/rebase pushes; remove it if verification fails or is incomplete. Members of `TauCetiProject/self-tested` have triage access after accepting their organisation invitation. Reviews and staging tests remain required.
+
+Agents run three of the PR template's quality-pass checks by default, Q1, Q2 and Q5, and begin each other line `declined — not run`. Use `tauceti work --full-quality` (or `full_quality = true` in a worker definition) to have them run all five.

@@ -77,7 +77,6 @@ from .constants import (
     EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
-    EX_RECOVERY_IDLE,
     EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -155,6 +154,7 @@ environment (flags win; full reference linked below):
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
   TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude token; see --auto-refresh)
+  TAUCETI_FULL_QUALITY=1 same as --full-quality
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
   TAUCETI_OVERLAP_BATCH_COMMITS  commits per scan session (default 160)
@@ -215,6 +215,7 @@ def add_source_flags(parser):
 
 def add_work_flags(p: argparse.ArgumentParser) -> None:
     add_source_flags(p)
+    # Accepted and ignored: a loop driver from an older release may still pass them to a new child.
     p.add_argument("--recovery-only", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--recovery-agent", default=None, help=argparse.SUPPRESS)
     p.add_argument("--recovery-unpinned-profile", action="store_true", help=argparse.SUPPRESS)
@@ -366,6 +367,12 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="instruct source-changing agents to apply the self-tested label to eligible PRs after successful local verification",
+    )
+    p.add_argument(
+        "--full-quality",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="have agents run all five quality-pass checks; by default they run Q1, Q2 and Q5 and decline the others",
     )
     p.add_argument(
         "--extra-roadmap-prompt",
@@ -652,10 +659,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     activity.add_argument("--json", action="store_true")
     activity.add_argument("--inventory", action="store_true", help="read prepared PR identity inventory as JSON")
-
-    recovery = sub.add_parser("recovery", help="list saved unfinished source and moved-aside checkouts; local only")
-    recovery.add_argument("--worker-id", dest="worker_id", default=None)
-    recovery.add_argument("--json", action="store_true")
 
     cleanup = sub.add_parser("cleanup", help="reclaim disposable caches and expired diagnostics; local only")
     cleanup.add_argument("--all-data-roots", action="store_true", help="include retired Fleet data roots")
@@ -968,8 +971,6 @@ def main(argv: list[str] | None = None) -> int:
         from .activity import command
 
         return command(args)
-    if cmd == "recovery":
-        return cmd_recovery(args)
     if cmd == "cleanup":
         from .retention import cmd_cleanup
 
@@ -1014,7 +1015,16 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "_fleet-protocol":
         print(
             json.dumps(
-                {"version": 1, "admission": True, "events": True, "activity": 1, "roadmap_focus": 1, "self_tested": 1}
+                {
+                    "version": 1,
+                    "admission": True,
+                    "events": True,
+                    "activity": 1,
+                    "roadmap_focus": 1,
+                    "self_tested": 1,
+                    "source_selection": 1,
+                    "graceful_restart": 1,
+                }
             )
         )
         return 0
@@ -1260,38 +1270,6 @@ def cmd_usage(args) -> int:
     return 0 if all(v.get("ok") for v in snap.values()) else 1
 
 
-def cmd_recovery(args) -> int:
-    """Local recovery records: never GitHub, never a reset, never a required step."""
-    from . import work_recovery
-
-    rows = []
-    for worker, record, manifest, status in work_recovery.records():
-        if args.worker_id and worker != args.worker_id:
-            continue
-        rows.append(
-            dict(
-                worker=worker,
-                record=str(record) if record else None,
-                state=status.get("state") or ("corrupt" if record and manifest is None else "unknown"),
-                reason=status.get("reason"),
-                work=(manifest or {}).get("work"),
-                pr=(manifest or {}).get("pr"),
-                local_head=(manifest or {}).get("local_head"),
-            )
-        )
-    if args.json:
-        print(json.dumps(rows, indent=2))
-        return 0
-    if not rows:
-        print("No local recovery records.")
-    for row in rows:
-        target = f" #{row['pr']}" if row["pr"] else ""
-        print(f"{row['worker']}: {row['state']} {row['record'] or '(incomplete save)'} {row['work'] or ''}{target}")
-        if row["reason"]:
-            print("  " + work_recovery.describe_reason(row["reason"]))
-    return 0
-
-
 def cmd_status(args) -> int:
     cfg = Config.resolve(getattr(args, "worker_id", None))
     gh = GitHub()
@@ -1396,6 +1374,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # Persist the operator's choice into loop children and recovery rounds.
     if getattr(args, "self_tested", None) is not None:
         os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
+    if getattr(args, "full_quality", None) is not None:
+        os.environ["TAUCETI_FULL_QUALITY"] = "1" if args.full_quality else "0"
     # --extra-roadmap-prompt likewise: validated here, at the boundary, then read live by do_roadmap via
     # extra_roadmap_prompt() so loop children see it without a flag of their own.
     if getattr(args, "extra_roadmap_prompt", None) is not None:
@@ -1529,70 +1509,30 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             time.sleep(int(slp))
             return 0
 
-        # Source recovery precedes provider selection/admission and unrelated work. A
-        # mechanically valid repair can publish even when all model budgets are closed.
-        # Audit-only workers author nothing; mixed workers recover their other phases' repairs.
+        # Rendered review output awaiting publication is posted before provider admission: it only
+        # retries GitHub (or native forge) API writes of a review that already finished.
         if not dry and set(only) != {"security-audit"}:
-            from .quota import mirror_creds
-            from .repair_recovery import recover
-            from .work_recovery import guard
-
             try:
-                mirror_creds(cfg)
-                recovery_opts = RoundOpts(
-                    only=only,
-                    agent=getattr(args, "recovery_agent", None) or agent,
-                    work_model="auto",
-                    sandbox_host=not getattr(args, "bubble", False),
-                    dry_run=False,
-                    prs=prs,
-                    account=getattr(args, "account", None),
-                    ignore_quota=ignore_quota,
-                    quota_cmd=quota_cmd,
-                    authoring_profile=(
-                        resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
-                        if agent != "auto"
-                        and (author_model or author_effort)
-                        and not getattr(args, "recovery_unpinned_profile", False)
-                        else None
-                    ),
-                )
                 if os.environ.get("TAUCETI_WORKER_FORGES") != "forgejo":
                     try:
-                        recovery_gh = GitHub()
-                        if (cfg.checkout / ".git").exists():
-                            guard(cfg, cfg.checkout, repository=recovery_gh.repo)  # Preserve before selecting recovery.
-                        recovery_worker = Worker(
-                            cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
-                        )
+                        review_gh = GitHub()
+                        from types import SimpleNamespace
+
                         from .review_runtime import recover as recover_review
 
-                        if recover_review(recovery_worker, numbers=getattr(recovery_opts, "prs", ())) or recover(
-                            recovery_worker, recovery_opts
-                        ):
+                        if recover_review(SimpleNamespace(cfg=cfg, gh=review_gh), numbers=prs):
                             return 0
                     except Exception as error:
-                        log(f"GitHub recovery deferred ({type(error).__name__}); checking other selected sources")
+                        log(f"review publication retry deferred ({type(error).__name__}); checking other sources")
                 from .worker_sources import enabled
 
                 if enabled():
-                    from .multi_source import recover_native
+                    from .multi_source import publish_native_reviews
 
-                    if recover_native(cfg, ctx, recovery_opts):
+                    if publish_native_reviews(cfg, prs):
                         return 0
             except Exception as error:
-                log(f"recovery phase deferred; existing source is preserved: {type(error).__name__}: {error}")
-                report_runtime(
-                    recovery_reason=dict(
-                        code="recovery-phase-unavailable",
-                        detail=str(error),
-                        next_action="Repair recovery state storage or its local prerequisites",
-                    )
-                )
-            if getattr(args, "recovery_only", False):
-                if ctx.activity:
-                    ctx.activity.rc = EX_RECOVERY_IDLE
-                return EX_RECOVERY_IDLE
+                log(f"review publication retry deferred: {type(error).__name__}: {error}")
 
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,

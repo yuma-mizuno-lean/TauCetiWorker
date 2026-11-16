@@ -88,7 +88,7 @@ for rollup, want in [
     ([{"context": "build", "state": "SUCCESS"}], False),
     ([{"context": "build", "state": "PENDING"}, {"context": "self-tested/1", "state": "SUCCESS"}], False),
 ]:
-    fresh = raw(statusCheckRollup=rollup, labels=[{"name": "self-tested"}])
+    fresh = raw(statusCheckRollup=rollup, labels=[] if want else [{"name": "self-tested"}])
     live = SimpleNamespace(gh=SimpleNamespace(pr_view=lambda *_args, f=fresh: f))
     assert w._still_actionable("bump", live, None, candidate) is want, rollup
 moved = SimpleNamespace(gh=SimpleNamespace(pr_view=lambda *_args: pending | {"headRefOid": "c" * 40}))
@@ -146,8 +146,8 @@ with patch.object(w, "run_in_bubble", return_value=0) as launch:
         == 0
     )
     prompt = launch.call_args.args[2]
-    assert "1970-01-01 00:18:43 UTC" in prompt
-    assert "push it once" in prompt
+    assert "round ends at" not in prompt and "checkpoint" not in prompt
+    assert "anything unpushed is discarded" in prompt
     assert "CI red" in prompt
     assert "You may NOT close this PR" in prompt
 

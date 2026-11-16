@@ -318,17 +318,21 @@ def display_survey(cfg, gh):
     return result
 
 
-def recover_native(cfg, ctx, opts):
-    """Reconcile retained native publication before model admission."""
-    from .repair_recovery import recover
-    from .source_claims import SourceClaims
+def publish_native_reviews(cfg, prs=()):
+    """Retry publication of rendered native-forge review output before model admission."""
     from .source_publication import pending
-    from .work_units import Worker
 
     source = native_source(cfg)
     cfg = source_config(cfg, source)
     if source.anonymous_discovery:
         return False
     with activate(source, cfg):
-        worker = Worker(cfg, source, ReviewState(cfg, source), Counters(cfg), ctx, SourceClaims(cfg, ctx, source))
-        return pending(source, cfg, numbers=getattr(opts, "prs", ())) or recover(worker, opts)
+        import os
+        from types import SimpleNamespace
+
+        if os.environ.get("TAUCETI_NATIVE_REVIEW_PUBLISHER"):
+            from .native_review_publisher import QueueReviewPublisher
+
+            if QueueReviewPublisher(SimpleNamespace(source=source)).reconcile(numbers=prs):
+                return True
+        return pending(source, cfg, numbers=prs)
