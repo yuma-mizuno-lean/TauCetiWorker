@@ -51,6 +51,10 @@ def test_credits_above_the_floor():
     assert status(payload()) == (["over-pace"], False, "over-pace")
     assert _unavail_reason(q._codex_from_payload(payload()))[0] is True
     assert status(payload(unlimited=True, has_credits=False, balance=None))[2] == "over-pace"
+    # The plan's own limit reached, as the endpoint reports it once the included usage is spent:
+    # the credits still cover the request.
+    reached = payload(allowed=False, limit_reached=True)
+    assert status(reached) == (["over-pace"], False, "over-pace")
 
 
 def test_spent_window_stays_exhausted():
@@ -60,8 +64,7 @@ def test_spent_window_stays_exhausted():
         payload(balance="19999.5"),
         payload(has_credits=False),
         payload(overage=True),
-        payload(allowed=False),
-        payload(limit_reached=True),
+        payload(allowed=False, limit_reached=True, balance="19999.5"),
         payload(balance="not a number"),
         {k: v for k, v in payload().items() if k != "credits"},
     ):
