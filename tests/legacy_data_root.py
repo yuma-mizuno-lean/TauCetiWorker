@@ -27,6 +27,35 @@ def _parent(pid):
             return None
 
 
+_REAL_PROCESSES = retention._processes  # fixtures patch the module attribute
+
+
+def _own_processes(mine, *, children=True):
+    """retention._processes limited to `mine` (and their children), read without touching others.
+
+    Unrelated processes that refuse inspection (a CI runner's own helpers, or another test's
+    sandboxed children) must not make these fixtures report "cannot be inspected".
+    """
+    if not Path("/proc/self/fd").is_dir():  # macOS: filter the full observation instead
+        observed = _REAL_PROCESSES()
+        if observed is None:
+            return None
+        kids = {pid for *_rest, pid in observed if children and _parent(pid) in mine}
+        return [entry for entry in observed if entry[3] in mine | kids]
+    observed = []
+    for process in Path("/proc").glob("[0-9]*"):
+        pid = int(process.name)
+        if pid not in mine and not (children and _parent(pid) in mine):
+            continue
+        try:
+            entry = retention._linux_process(process, os.getuid())
+        except OSError:
+            return None
+        if entry is not None:
+            observed.append(entry)
+    return observed
+
+
 class LegacyDataRoot(unittest.TestCase):
     def test_code_upgrade_reuses_data_and_cleanup_inventory(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -320,17 +349,8 @@ class LegacyDataRoot(unittest.TestCase):
         stack.enter_context(patch.object(purge, "VERIFY_TMP", base / "tmp"))
         stack.enter_context(patch.object(purge, "stop_services", return_value=[]))
         # Only this test's processes: real workers running on the host must not affect fixtures.
-        real = retention._processes
         mine = {os.getpid()}
-
-        def fixture_processes():
-            observed = real()
-            if observed is None:
-                return None
-            children = {pid for *_rest, pid in observed if _parent(pid) in mine}
-            return [entry for entry in observed if entry[3] in mine | children]
-
-        stack.enter_context(patch.object(retention, "_processes", side_effect=fixture_processes))
+        stack.enter_context(patch.object(retention, "_processes", side_effect=lambda: _own_processes(mine)))
         return stack
 
     def test_purge_removes_only_what_is_provably_ours(self):
@@ -422,13 +442,23 @@ class LegacyDataRoot(unittest.TestCase):
                 self.addCleanup(selector.wait)
                 self.addCleanup(selector.kill)
                 time.sleep(0.2)
-                with self.assertRaisesRegex(config.Die, "selects"):
-                    purge.cmd_purge(SimpleNamespace(yes=True, config=False))
-                selector.kill()
-                selector.wait()
-                purge.stop_services.return_value = ["tauceti-workers.service is still active"]
-                with self.assertRaisesRegex(config.Die, "could not stop"):
-                    purge.cmd_purge(SimpleNamespace(yes=True, config=False))
+                # Scan only the selector and this test's own lineage: a concurrently running test
+                # module's sandboxed processes (`bwrap --unshare-pid`) refuse inspection, which
+                # purge rightly reports instead of the selection this test is about.
+                inspect = retention._linux_process
+
+                def only_ours(process, uid):
+                    pid = int(process.name)
+                    return inspect(process, uid) if pid == selector.pid or pid in purge._lineage() else None
+
+                with patch.object(retention, "_linux_process", only_ours):
+                    with self.assertRaisesRegex(config.Die, "selects"):
+                        purge.cmd_purge(SimpleNamespace(yes=True, config=False))
+                    selector.kill()
+                    selector.wait()
+                    purge.stop_services.return_value = ["tauceti-workers.service is still active"]
+                    with self.assertRaisesRegex(config.Die, "could not stop"):
+                        purge.cmd_purge(SimpleNamespace(yes=True, config=False))
             self.assertTrue((data / "state/w/recovery/saved/patch.diff").exists())
             self.assertTrue((base / "elsewhere/tauceti").exists())
 
@@ -625,7 +655,12 @@ class LegacyDataRoot(unittest.TestCase):
             base = Path(temporary).resolve()
             units = base / "config/systemd/user"
             units.mkdir(parents=True)
-            for name in ("tauceti-workers.service", "tauceti-cleanup.timer", "tauceti-cleanup.service"):
+            for name in (
+                "tauceti-workers.service",
+                "tauceti-workers.slice",
+                "tauceti-cleanup.timer",
+                "tauceti-cleanup.service",
+            ):
                 (units / name).write_text("")
             calls = []
 
@@ -642,10 +677,215 @@ class LegacyDataRoot(unittest.TestCase):
                 patch.object(purge.subprocess, "run", side_effect=run),
             ):
                 self.assertEqual(purge.stop_services(), [])
-            names = ["tauceti-cleanup.service", "tauceti-cleanup.timer", "tauceti-workers.service"]
+            names = [
+                "tauceti-cleanup.service",
+                "tauceti-cleanup.timer",
+                "tauceti-workers.service",
+                "tauceti-workers.slice",
+            ]
             self.assertEqual(calls[0], ["stop", *names])
             self.assertEqual(calls[1], ["disable", *names])
             self.assertEqual(list(units.iterdir()), [])
+
+    def test_fleet_runtime_uses_the_fixed_fleet_root(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ):
+            home = Path(temporary).resolve()
+            fleet = home / ".local/share/tauceti-fleet"
+            package = fleet / "worker-runtimes/abc123/lib/python3.13/site-packages/tauceti_worker"
+            fixed, user = fleet / "worker-data/root", home / ".local/share/tauceti"
+            for name in ("TAUCETI_LEGACY_DATA_ROOT", "XDG_DATA_HOME"):
+                os.environ.pop(name, None)
+            with (
+                patch.object(paths, "INSTALLED", True),
+                patch.object(paths, "HERE", package),
+                patch.object(paths, "login_home", return_value=home),
+                patch.object(sys, "platform", "linux"),
+            ):
+                self.assertEqual(paths.fleet_data_root(), fixed)
+                self.assertEqual(paths.legacy_data_root(), fixed)
+                self.assertEqual(os.environ.pop("TAUCETI_LEGACY_DATA_ROOT"), str(fixed))
+                (user / "state/w").mkdir(parents=True)  # workers that predate the fixed root
+                self.assertEqual(paths.legacy_data_root(), user)
+                os.environ.pop("TAUCETI_LEGACY_DATA_ROOT")
+                (fixed / "state").mkdir(parents=True)  # once moved, the fixed root wins
+                self.assertEqual(paths.legacy_data_root(), fixed)
+                os.environ.pop("TAUCETI_LEGACY_DATA_ROOT")
+            with patch.object(paths, "INSTALLED", True), patch.object(paths, "HERE", home / "uv/tools/tauceti_worker"):
+                self.assertIsNone(paths.fleet_data_root())
+
+    def test_fleet_service_unit_survives_runtime_updates(self):
+        from tauceti_worker import worker_manager
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ):
+            home = Path(temporary).resolve()
+            fleet = home / ".local/share/tauceti-fleet"
+
+            def runtime(revision):
+                path = fleet / "worker-runtimes" / revision
+                (path / "lib/python3.13/site-packages/tauceti_worker").mkdir(parents=True)
+                (path / "bin").mkdir()
+                (path / "bin/tauceti").write_text(f"#!/bin/sh\necho {revision}\n")
+                (path / "bin/tauceti").chmod(0o755)
+                return path
+
+            old = runtime("abc123")
+            config_file = home / ".config/tauceti/workers.toml"
+            os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(home / "data")
+            os.environ["PATH"] = f"{old / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
+            with (
+                patch.object(paths, "INSTALLED", True),
+                patch.object(paths, "HERE", old / "lib/python3.13/site-packages/tauceti_worker"),
+                patch.object(paths, "login_home", return_value=home),
+            ):
+                # Never fall back to the running revision's console script, which an update deletes.
+                with self.assertRaisesRegex(worker_manager.WorkersError, "launcher"):
+                    worker_manager._service_command(config_file)
+                (fleet / "bin").mkdir()
+                (fleet / "bin/tauceti").symlink_to(old / "bin/tauceti")
+                unit = worker_manager._systemd_unit(config_file)
+                command = worker_manager._service_command(config_file)
+            # The launcher Fleet repoints at each pinned revision, and a working directory that a
+            # runtime update cannot delete.
+            self.assertIn(f'ExecStart="{fleet}/bin/tauceti" "workers" "--config" "{config_file}" "manager"', unit)
+            self.assertIn(f"WorkingDirectory={home}\n", unit)
+            self.assertIn('Environment="PYTHONPATH="\n', unit)
+            self.assertNotIn(str(old), unit.replace(os.environ["PATH"], ""))
+            # A Fleet update repoints the launcher and deletes the old revision; the command follows.
+            new = runtime("def456")
+            (fleet / "bin/tauceti").unlink()
+            (fleet / "bin/tauceti").symlink_to(new / "bin/tauceti")
+            for path in sorted(old.rglob("*"), reverse=True):
+                path.unlink() if not path.is_dir() else path.rmdir()
+            old.rmdir()
+            ran = subprocess.run(command[:1], capture_output=True, text=True, check=True, cwd=home)
+            self.assertEqual(ran.stdout.strip(), "def456")
+            with patch.object(paths, "INSTALLED", False):
+                self.assertEqual(worker_manager._service_working_directory(), paths.HERE)
+
+    def test_data_inside_a_virtualenv_is_refused_or_reported(self):
+        from tauceti_worker.config import Die
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            venv = base / "runtime"
+            venv.mkdir()
+            (venv / "pyvenv.cfg").write_text("")
+            package = venv / "lib/python3.13/site-packages/tauceti_worker"
+            package.mkdir(parents=True)
+            outside = base / "data"
+            self.assertEqual(paths.virtualenv_data(outside), [])
+            paths.refuse_virtualenv_data_root(outside)
+            with self.assertRaisesRegex(Die, "inside the virtualenv"):
+                paths.refuse_virtualenv_data_root(package)  # it would start new data there
+            (package / "state").mkdir()  # an established root, even without the optional parts
+            with patch("tauceti_worker.config.warn_red") as warned:
+                paths.refuse_virtualenv_data_root(package)  # reported, not an outage
+                self.assertEqual(warned.call_count, len(paths.DATA_PARTS))
+                paths.refuse_virtualenv_data_root(package, warn=False)  # a loop's round
+                self.assertEqual(warned.call_count, len(paths.DATA_PARTS))
+            outside.mkdir()
+            for part in paths.DATA_PARTS:
+                (package / part).mkdir(exist_ok=True)
+                (package / part).rename(outside / part)
+                (package / part).symlink_to(outside / part)
+            self.assertEqual(paths.virtualenv_data(package), [])
+            paths.refuse_virtualenv_data_root(package)
+
+    def test_runtime_linked_into_the_fixed_root_survives_cleanup(self):
+        """The live move: each part renamed into the fixed root, a symbolic link left behind."""
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            fleet = home / ".local/share/tauceti-fleet"
+            runtime = fleet / "worker-runtimes/dc139e51"
+            old = runtime / "lib/python3.13/site-packages/tauceti_worker"
+            fixed = fleet / "worker-data/root"
+            old.mkdir(parents=True)
+            (runtime / "pyvenv.cfg").write_text("")
+            self.retired_fixture(old)
+            (old / "host-repositories/TauCeti.git").mkdir(parents=True)
+            (old / "host-repositories/TauCeti.git/HEAD").write_text("ref: refs/heads/main")
+            fixed.mkdir(parents=True)
+            for part in paths.DATA_PARTS:
+                (old / part).rename(fixed / part)
+                (old / part).symlink_to(fixed / part)
+            files = sorted(p.relative_to(fixed) for p in fixed.rglob("*"))
+            # Another root a registry still names, also only links into the fixed root.
+            alias = fleet / "worker-data/retained/alias"
+            alias.mkdir(parents=True)
+            for part in ("state", "checkouts"):
+                (alias / part).symlink_to(fixed / part)
+            (fleet / "worker-data/roots.json").write_text(json.dumps(dict(roots={"alias": str(alias)})))
+            mine = {os.getpid()}
+
+            def fixture_processes():
+                return _own_processes(mine, children=False)
+
+            for selected in (fixed, old):  # the drop-in updated; a worker not yet restarted
+                seen = []
+
+                def collect(seen=seen, **_kwargs):
+                    seen.append(paths.legacy_data_root())
+                    return retention.fresh_report()
+
+                with (
+                    patch.dict(os.environ, TAUCETI_LEGACY_DATA_ROOT=str(selected), TAUCETI_ACTIVITY_DIR=f"{home}/a"),
+                    patch.object(retention.Config, "resolve", return_value=SimpleNamespace(home=home)),
+                    patch.object(retention, "legacy_project", return_value=True),
+                    patch.object(paths, "INSTALLED", True),
+                    patch.object(retention, "HERE", fleet / "worker-runtimes/new/lib/python3.13/site-packages/x"),
+                    patch.object(retention, "_configured_texts", return_value=[]),
+                    patch.object(retention, "_processes", side_effect=fixture_processes),
+                    patch.object(retention, "sweep", side_effect=collect),
+                    patch.object(retention, "worker_configs", return_value=[]),
+                ):
+                    self.assertEqual(retention.data_roots(), [selected])
+                    self.assertEqual(retention.retired_roots(), [])
+                    dry = retention.run_all(dry=True)
+                    self.assertEqual(dry["removed"], [])
+                    report = retention.run_all()  # one lock per real state directory
+                    self.assertEqual([item["path"] for item in report["roots"]], [str(selected)])
+                    self.assertEqual(seen, [selected, selected])
+                    self.assertEqual(report["removed"], [])
+                    self.assertEqual(report["errors"], [])
+                    self.assertEqual(paths.virtualenv_data(paths.legacy_data_root()), [])
+                after = sorted(p.relative_to(fixed) for p in fixed.rglob("*") if p.name != ".cleanup.lock")
+                self.assertEqual(after, files)
+                for part in paths.DATA_PARTS:
+                    self.assertEqual((old / part).readlink(), fixed / part)
+            self.assertEqual((fixed / "state/w/recovery/saved/patch.diff").read_text(), "unpublished")
+            # A root of its own that merely shares host-repositories is still collected.
+            other = fleet / "worker-runtimes/other/lib/python3.13/site-packages/tauceti_worker"
+            (other / "state/v").mkdir(parents=True)
+            (other / "host-repositories").symlink_to(fixed / "host-repositories")
+            with (
+                patch.dict(os.environ, TAUCETI_LEGACY_DATA_ROOT=str(fixed)),
+                patch.object(retention.Config, "resolve", return_value=SimpleNamespace(home=home)),
+                patch.object(retention, "legacy_project", return_value=True),
+            ):
+                self.assertEqual(retention.data_roots(), [fixed, other])
+                self.assertEqual(retention.retired_roots(), [])  # shares a real directory: kept
+
+    def test_purge_owns_the_fleet_default_root(self):
+        from tauceti_worker import purge
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            home = base / "home"
+            package = home / ".local/share/tauceti-fleet/worker-runtimes/r/lib/python3.13/site-packages/tauceti_worker"
+            fixed = home / ".local/share/tauceti-fleet/worker-data/root"
+            self.retired_fixture(fixed)
+            package.mkdir(parents=True)
+            with self.purging(base, home, package), patch.object(sys, "platform", "linux"):
+                planned, _roots, overridden, _refused = purge.plan()
+                self.assertIn(fixed, planned)
+                self.assertEqual([item for item in overridden if "LEGACY" in item], [])
+            with self.purging(base, home, package, TAUCETI_LEGACY_DATA_ROOT=str(base / "custom")):
+                (base / "custom/state").mkdir(parents=True)
+                planned, _roots, overridden, _refused = purge.plan()
+                self.assertNotIn(base / "custom/state", planned)
+                self.assertIn(f"TAUCETI_LEGACY_DATA_ROOT={base / 'custom'}", overridden)
 
     def test_default_and_invalid_override(self):
         with patch.dict(os.environ, {}, clear=False):

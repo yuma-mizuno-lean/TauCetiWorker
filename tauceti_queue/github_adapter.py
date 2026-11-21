@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json
+import logging
 import os
 import re
 import subprocess
@@ -51,11 +52,13 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 
-from . import chain, declaration_names, diagnostics, github_app, ports
+from . import chain, declaration_names, diagnostics, diff_guard, github_app, ports
 from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
 
 API = github_app.API
 API_VERSION = "2022-11-28"
+# Installation requests (GraphQL: points) left in a window below which background reads wait for the reset.
+DEFAULT_BACKGROUND_FLOOR = 1000
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
 STAGING_WORKFLOW = "pr-build.yml"
@@ -66,8 +69,11 @@ COMMENT_MARKER = "<!-- tauceti-queue {marker} -->"
 # Bors treats collaborators with push access as reviewers (`auto_reviewer_required_perm: :push`).
 REVIEWER_PERMISSIONS = frozenset({"admin", "maintain", "write"})
 MAX_LOG_BYTES = 64 * 1024 * 1024
+# How long a self-tested evaluation waits when the App cannot read team membership.
+MEMBERS_PERMISSION_RETRY_SECONDS = 900
 
 Transport = github_app.Transport
+log = logging.getLogger(__name__)
 Phase = CandidatePhase
 
 
@@ -210,6 +216,7 @@ class GitHubClient:
         api: str = API,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        background_floor: int = DEFAULT_BACKGROUND_FLOOR,
     ) -> None:
         self._tokens = tokens
         self._transport = transport
@@ -220,6 +227,9 @@ class GitHubClient:
         self._priority = threading.Condition(self._lock)
         self._essential: dict[str, int] = {}
         self._resource_limits: dict[str, dict] = {}
+        # Background reads stop while a bucket has at most this many requests (GraphQL: points)
+        # left, until it resets; essential requests keep the reserved floor.
+        self.background_floor = background_floor
         self._background_at: dict[str, float] = {}
         self._local = threading.local()
         self._blocked_until: dict[str, float] = {}
@@ -246,6 +256,11 @@ class GitHubClient:
                     target, key = self._blocked_until, resource
                 target[key] = max(target.get(key, 0), deadline)
 
+    def release_background_holds(self) -> None:
+        """Forget restored background waits; the live quota and current floor decide the next read."""
+        with self._lock:
+            self._background_at.clear()
+
     def stats(self) -> dict:
         with self._lock:
             return {
@@ -265,12 +280,9 @@ class GitHubClient:
         with self._lock:
             return self.remaining, self.reset_at
 
-    def _record(self, headers: dict[str, str], resource="core", *, cost=None) -> None:
+    def _record(self, headers: dict[str, str], resource="core") -> None:
         with self._lock:
             record = self._resource_limits.setdefault(resource, {})
-            previous_remaining, previous_reset = record.get("remaining"), record.get("reset_at")
-            if isinstance(cost, int) and cost > 0:
-                record["cost"] = cost
             try:
                 if "x-ratelimit-remaining" in headers:
                     record["remaining"] = int(headers["x-ratelimit-remaining"])
@@ -285,32 +297,61 @@ class GitHubClient:
                 self.limit = record.get("limit")
                 self.reset_at = record.get("reset_at")
             remaining, reset = record.get("remaining"), record.get("reset_at")
-            now = self._clock()
-            observed = "x-ratelimit-remaining" in headers or cost is not None
-            if observed and remaining is not None and reset is not None and reset > now:
+            if (
+                "x-ratelimit-remaining" in headers
+                and remaining is not None
+                and reset is not None
+                and reset > self._clock()
+            ):
                 if remaining <= 0:
                     self._blocked_until[resource] = reset + 1
-                else:
-                    # Background reads share the real remaining window; essential requests
-                    # consume their share immediately and their responses adjust this spacing.
-                    next_at = now + record.get("cost", 1) * (reset - now) / remaining
-                    if previous_reset == reset and previous_remaining is not None and remaining <= previous_remaining:
-                        next_at = max(next_at, self._background_at.get(resource, 0))
-                    self._background_at[resource] = min(reset + 1, next_at)
+
+    def _background_hold(self, resource) -> float:
+        """When background reads of `resource` may resume (the caller holds `_lock`).
+
+        At or below `background_floor` that is the window's reset: the floor is reserved for
+        essential requests. A wait restored from before a restart holds until its own deadline.
+        """
+        record = self._resource_limits.get(resource, {})
+        remaining, reset = record.get("remaining"), record.get("reset_at")
+        hold = self._background_at.get(resource, 0)
+        if remaining is not None and reset is not None and remaining <= self.background_floor:
+            hold = max(hold, reset + 1)
+        return hold
+
+    def _floor_deferral(self, resource) -> RequestDeferred | None:
+        with self._lock:
+            hold = self._background_hold(resource)
+        if hold <= self._clock():
+            return None
+        return RequestDeferred(
+            f"background reads wait for the GitHub quota reset at the {self.background_floor}-request floor",
+            retry_at=hold,
+            resource=resource + ":background",
+        )
 
     # -- requests
 
-    def _send(self, method, url, headers, body, *, resource, deferred):
+    def _send(self, method, url, headers, body, *, resource, deferred, floor=False, record=None):
         # Essential queue/CI requests never wait for background intake. Before each intake
-        # request, let already-active essential work finish on that bucket. There is no fixed
-        # quota reserve; unrelated buckets and essential requests remain free to run.
+        # request, let already-active essential work finish on that bucket, then check the floor
+        # again with their responses recorded. Unrelated buckets and essential requests remain
+        # free to run.
         with self._priority:
             while deferred and self._essential.get(resource, 0):
                 self._priority.wait()
             if not deferred:
                 self._essential[resource] = self._essential.get(resource, 0) + 1
+        if floor:
+            pending = self._floor_deferral(resource)
+            if pending is not None:
+                raise pending
         try:
-            return self._transport(method, url, headers, body)
+            status, response_headers, data = self._transport(method, url, headers, body)
+            response_headers = {k.lower(): v for k, v in response_headers.items()}
+            if record is not None:
+                record(response_headers)
+            return status, response_headers, data
         finally:
             if not deferred:
                 with self._priority:
@@ -322,8 +363,9 @@ class GitHubClient:
         """Background intake persists waits instead of sleeping inside a source read.
 
         This is thread-local: essential queue and command calls retain their existing retry
-        behavior. A known exhausted bucket refuses new reads until its original deadline;
-        trying another PR cannot move that deadline further away.
+        behavior. Background reads run at full speed until a bucket of the installation reaches
+        `background_floor`, then wait for its reset. A known exhausted bucket refuses new reads
+        until its original deadline; trying another PR cannot move that deadline further away.
         """
         previous = getattr(self._local, "deferred", False)
         prior_background = getattr(self._local, "background", False)
@@ -376,14 +418,9 @@ class GitHubClient:
                     raise RateLimited("GitHub resource wait", retry_at=deadline, resource=blocked_resource)
                 self._sleep(deadline - self._clock())
             if background:
-                with self._lock:
-                    next_at = self._background_at.get(resource, 0)
-                if next_at > self._clock():
-                    raise RequestDeferred(
-                        "background read paced by remaining GitHub capacity",
-                        retry_at=next_at,
-                        resource=resource + ":background",
-                    )
+                pending = self._floor_deferral(resource)
+                if pending is not None:
+                    raise pending
         body = None if json_body is None else json.dumps(json_body).encode()
         accepted = set(ok) | set(tolerate)
         attempt = 0
@@ -406,17 +443,24 @@ class GitHubClient:
                 used_installation = True
             with self._lock:
                 self.requests += 1
+            # GET /user uses an operator/worker bearer, and GET /app uses an App JWT. Neither is
+            # the installation bucket used for queue/intake work, so neither is recorded or floored.
             status, response_headers, data = self._send(
-                method, url, headers, body, resource=resource, deferred=background
+                method,
+                url,
+                headers,
+                body,
+                resource=resource,
+                deferred=background,
+                floor=background and token is None,
+                record=(
+                    None
+                    if token is not None
+                    else lambda seen: self._record(
+                        seen, seen.get("x-ratelimit-resource") or (resource if not record_limit else "core")
+                    )
+                ),
             )
-            response_headers = {k.lower(): v for k, v in response_headers.items()}
-            if token is None:
-                # GET /user uses an operator/worker bearer, and GET /app uses an App JWT.
-                # Neither is the installation bucket used for queue/intake work.
-                self._record(
-                    response_headers,
-                    response_headers.get("x-ratelimit-resource") or (resource if not record_limit else "core"),
-                )
             if status in accepted:
                 return Response(status, response_headers, data)
             if status == 401 and used_installation and attempt == 1:
@@ -447,6 +491,25 @@ class GitHubClient:
                 continue
             self._fail(f"HTTP {status} on {method} {path}")
             raise GitHubError(f"HTTP {status} on {method} {path}", status, data)
+
+    def record_response(self, method: str, path: str, status: int, headers: dict[str, str], body: bytes = b"") -> None:
+        """Account for a response this client did not send itself (a raw, never-retried POST).
+
+        Its rate-limit headers update the shared counters, and a primary or secondary limit blocks
+        the bucket and raises `RateLimited` with GitHub's deadline, exactly as `request` would."""
+        headers = {k.lower(): v for k, v in headers.items()}
+        with self._lock:
+            self.requests += 1
+        self._record(headers, headers.get("x-ratelimit-resource") or "core")
+        wait = self._limit_wait(status, headers, body)
+        if wait is None:
+            return
+        blocked_resource = "core" if headers.get("x-ratelimit-remaining") == "0" else "secondary"
+        deadline = self._clock() + wait
+        with self._lock:
+            self._blocked_until[blocked_resource] = max(self._blocked_until.get(blocked_resource, 0), deadline)
+        self._fail(f"rate limited for {wait:.0f}s on {method} {path}")
+        raise RateLimited(f"rate limited for {wait:.0f}s", status, body, retry_at=deadline, resource=blocked_resource)
 
     def _retry(self) -> None:
         with self._lock:
@@ -551,7 +614,7 @@ class GitHubClient:
             reset = _timestamp(rate.get("resetAt"))
             if reset is not None:
                 headers["x-ratelimit-reset"] = str(reset)
-            self._record(headers, "graphql", cost=rate["cost"])
+            self._record(headers, "graphql")
         return data
 
     def fetch_bare(self, url: str) -> tuple[int, bytes]:
@@ -594,6 +657,21 @@ def dispatch_members(members: Sequence) -> list[dict]:
     return out
 
 
+# Bounds for the adapter's resident git caches: a few discovery passes of every open PR.
+DIFF_VERSION_CACHE = 20_000
+PRESENT_COMMIT_CACHE = 64
+# `_refresh_git_caches`'s fingerprint of a clone whose ancestry is its own: no graft, replacement or
+# shallow-file environment, no shallow file, no grafts file and no replacement refs.
+PLAIN_ANCESTRY = ((), None, None, ())
+
+
+def _remember(cache: dict, key, value, limit: int) -> None:
+    """Insert into a bounded, insertion-ordered cache, forgetting the oldest entries first."""
+    cache[key] = value
+    while len(cache) > limit:
+        del cache[next(iter(cache))]
+
+
 def _batch_id(value):
     return int(value) if str(value).isdigit() else value
 
@@ -633,6 +711,22 @@ class GitHubAdapter:
         self._admission_reads: dict = {}
         self._admission_listing: dict = {}
         self._admission_comment_pages: dict = {}
+        # Decision 38 step 4, slice 2: take the merge base from the clone instead of the compare
+        # API when it is unambiguous there (set from `admission_local_merge_base` each pass).
+        self.local_merge_base = False
+        self.merge_base_sources = {"local": 0, "compare": 0}
+        # Slice 5: which admission evaluations took the single GraphQL read, and which fell back.
+        self.snapshot_sources = {"single": 0, "full": 0}
+        # `_diff_version` of two commits never changes while the clone's ancestry is its own (no
+        # shallow boundary, grafts or replacements), and discovery asks it of every open PR against
+        # the same canonical tip on every pass: one git process per PR, not per pass. Both caches
+        # are checked again at the start of each discovery pass (`_refresh_git_caches`).
+        self._diff_versions: dict[tuple[str, str], str] = {}
+        self._present_commits: dict[str, None] = {}
+        self._ancestry: tuple | None = None
+        self._cache_lock = threading.Lock()
+        # Seconds this thread spent in `fetch_refs`, for admission's per-evaluation timing.
+        self._fetch_timing = threading.local()
 
     # -- pull requests
 
@@ -681,7 +775,15 @@ class GitHubAdapter:
             raise GitHubError("fetch_refs needs a clone directory")
         if self._tokens is None:
             raise GitHubError("fetch_refs needs the installation token source")
-        self._git_with_token(repo, ["fetch", "--no-tags", "--quiet", f"https://github.com/{repo}.git", *refspecs])
+        started = time.monotonic()
+        try:
+            self._git_with_token(repo, ["fetch", "--no-tags", "--quiet", f"https://github.com/{repo}.git", *refspecs])
+        finally:
+            self._fetch_timing.seconds = self.fetch_seconds() + time.monotonic() - started
+
+    def fetch_seconds(self) -> float:
+        """Seconds this thread has spent fetching into the clone (see `fetch_refs`)."""
+        return getattr(self._fetch_timing, "seconds", 0.0)
 
     def _git_with_token(self, repo: str, args: Sequence[str], *, check=True) -> subprocess.CompletedProcess:
         """Run git in the clone with the installation token as an `http.extraheader` in the environment."""
@@ -1071,7 +1173,9 @@ class GitHubAdapter:
         )
         jobs = result.get("jobs") if isinstance(result, dict) else None
         matching = (
-            [j for j in jobs if isinstance(j, dict) and j.get("name") == BUILD_JOB] if isinstance(jobs, list) else []
+            [j for j in jobs if isinstance(j, dict) and str(j.get("name") or "").rsplit(" / ", 1)[-1] == BUILD_JOB]
+            if isinstance(jobs, list)
+            else []
         )
         if len(matching) != 1 or (result.get("total_count") or len(jobs or [])) > 100:
             return declaration_names.unknown("build_job_ambiguous")
@@ -1086,6 +1190,23 @@ class GitHubAdapter:
         record = declaration_names.parse_log(log, head_sha)
         return {**record, "run_id": run_id, "run_attempt": attempt, "job_id": job["id"]}
 
+    def team_member_read(self, path: str):
+        """A team-membership read for the self-tested route, made by the queue App itself.
+
+        It needs the App's organization `members: read` permission. Without it the read is
+        deferred with a clear reason instead of falling back to a user token or answering "not a
+        member": an unknown membership never grants admission and never withdraws one.
+        """
+        granted = getattr(self._tokens or self.client._tokens, "granted_permissions", None)
+        if granted is not None and "members" not in granted():
+            log.warning("self-tested team membership needs the queue App's organization Members: read permission")
+            raise RequestDeferred(
+                "self-tested team membership needs the queue App's organization Members: read permission",
+                retry_at=self.client._clock() + MEMBERS_PERMISSION_RETRY_SECONDS,
+                resource="members-permission",
+            )
+        return self.client.get_json(path)[1]
+
     def eligibility_checks(self, repo: str, head: str) -> list[dict]:
         """Every `merge eligibility` check run on `head`, any App (`filter=all`), as Bors lists them."""
         return self.client.paginate(
@@ -1095,18 +1216,273 @@ class GitHubAdapter:
         )
 
     def _diff_version(self, base: str, head: str) -> str:
-        if (
-            not self.clone_dir
-            or not chain.object_exists(self.clone_dir, base)
-            or not chain.object_exists(self.clone_dir, head)
-        ):
+        """The PR's merge base with its target, or `unknown:<base>` while the clone lacks either.
+
+        Known results are kept (bounded) while the clone's ancestry is stable: the merge bases of
+        two commits are then fixed. One `git merge-base` answers the common case; only its failure
+        pays for the existence checks.
+        """
+        if not self.clone_dir:
             return "unknown:" + base
-        bases = sorted(chain.git(self.clone_dir, "merge-base", "--all", base, head).split())
+        key = (base, head)
+        with self._cache_lock:
+            known = self._diff_versions.get(key)
+            cacheable = self._ancestry == PLAIN_ANCESTRY
+        if known is not None:
+            return known
+        result = chain._git(self.clone_dir, "merge-base", "--all", base, head)
+        if result.returncode not in (0, 1) or result.returncode == 1 and result.stdout.strip():
+            if not chain.object_exists(self.clone_dir, base) or not chain.object_exists(self.clone_dir, head):
+                return "unknown:" + base
+            raise chain.ChainError(f"git merge-base --all failed ({result.returncode}): {result.stderr.strip()}")
+        bases = sorted(result.stdout.split())
         if not bases:
             raise GitHubError("PR and target have no merge base")
         # Advancing main normally leaves the reviewed diff unchanged. Multiple merge bases are
         # ambiguous: retain the target identity and let the compare API resolve a fresh decision.
-        return bases[0] if len(bases) == 1 else ",".join([*bases, base])
+        version = bases[0] if len(bases) == 1 else ",".join([*bases, base])
+        if cacheable:
+            with self._cache_lock:
+                _remember(self._diff_versions, key, version, DIFF_VERSION_CACHE)
+        return version
+
+    def _refresh_git_caches(self) -> None:
+        """At the start of a discovery pass: forget which commits the clone had (an unreferenced one
+        may since have been pruned), and every merge base if the clone's ancestry changed."""
+        ancestry = None
+        if self.clone_dir:
+            try:
+                paths = chain.git(self.clone_dir, "rev-parse", "--git-path", "shallow", "--git-path", "info/grafts")
+                marks = []
+                for path in paths.split():
+                    path = os.path.join(self.clone_dir, path)
+                    marks.append(os.stat(path).st_mtime_ns if os.path.exists(path) else None)
+                replaced = chain.git(
+                    self.clone_dir, "for-each-ref", "--format=%(refname) %(objectname)", "refs/replace/"
+                )
+                ancestry = (
+                    tuple(
+                        name
+                        for name in ("GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE")
+                        if os.environ.get(name)
+                    ),
+                    *marks,
+                    tuple(replaced.split()),
+                )
+            except (chain.ChainError, OSError):
+                ancestry = None  # unknown: nothing is kept
+        with self._cache_lock:
+            self._present_commits.clear()
+            if ancestry is None or ancestry != self._ancestry:
+                self._diff_versions.clear()
+            self._ancestry = ancestry
+
+    def _has_commit(self, sha: str) -> bool:
+        """Whether the clone has commit `sha`; a commit once seen is not asked again in this pass."""
+        with self._cache_lock:
+            if sha in self._present_commits:
+                return True
+        if not chain.object_exists(self.clone_dir, sha):
+            return False
+        with self._cache_lock:
+            _remember(self._present_commits, sha, None, PRESENT_COMMIT_CACHE)
+        return True
+
+    def _local_merge_base(self, base: str, head: str) -> str | None:
+        """The merge base compare would report, from the clone, or None when the clone cannot vouch
+        for it: a shallow clone (history may be cut), a missing object, or not exactly one base.
+
+        `base` and `head` are the exact OIDs this read fetched; the fence after the read still
+        requires both to be unchanged, so a moved head or target discards the result.
+        """
+        if not self.clone_dir or not SHA.fullmatch(base) or not SHA.fullmatch(head):
+            return None
+        if any(os.environ.get(name) for name in ("GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE")):
+            return None  # an environment that rewrites ancestry
+        try:
+            if chain.git(self.clone_dir, "rev-parse", "--is-shallow-repository").strip() != "false":
+                return None
+            grafts = chain.git(self.clone_dir, "rev-parse", "--git-path", "info/grafts").strip()
+            if os.path.exists(os.path.join(self.clone_dir, grafts)):
+                return None  # grafts change ancestry without making the clone shallow
+            if not chain.object_exists(self.clone_dir, base) or not chain.object_exists(self.clone_dir, head):
+                return None
+            # Replacement refs change ancestry too; GitHub's answer ignores them.
+            bases = chain.git(self.clone_dir, "--no-replace-objects", "merge-base", "--all", base, head).split()
+        except chain.ChainError:
+            return None
+        return bases[0] if len(bases) == 1 and SHA.fullmatch(bases[0]) else None
+
+    def _admission_paths(self, merge_base: str, head: str) -> tuple[str, ...]:
+        return tuple(
+            p
+            for p in chain.git(
+                self.clone_dir,
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                merge_base,
+                head,
+                "--",
+            ).split("\0")
+            if p
+        )
+
+    def _self_tested(self, repo, number, pull, paths, merge_base):
+        """Inline self-tested eligibility (live membership and bump reads), whether an admin's
+        `large-refactor` label lifts the size caps, and, for an eligible head, the PR-level diff
+        guards PR CI would have run."""
+        from tauceti_tools.self_tested import eligible, requested
+
+        local = False
+        if requested(pull.labels):
+            raw = {
+                "number": number,
+                "state": pull.state,
+                "labels": pull.labels,
+                "base": {"ref": pull.base_ref},
+                "head": {"sha": pull.head_sha, "ref": pull.head_ref, "repo": {"full_name": pull.head_repo}},
+                "user": {"login": pull.author_login},
+            }
+            local = eligible(
+                raw,
+                repo,
+                paths=paths,
+                read=lambda path: self.client.get_json(path)[1],
+                member_read=self.team_member_read,
+            )
+        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here. A labelled
+        # large refactor is measured too: an admin's approval of one may stand in for PR CI and review
+        # (`AdmissionIntake._large_refactor_approval`), and the caps the label keeps still apply.
+        exempt = diff_guard.large_refactor(
+            self.clone_dir, pull.head_sha, lambda path: self.client.get_json(path)[1], repo, number, pull.labels
+        )
+        measured = local or exempt
+        guard = (
+            diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if measured else ()
+        )
+        return local, guard, exempt
+
+    def bump_guard(self, repo: str, head: str) -> bool:
+        """The trusted Mathlib-bump check (`check-bump.sh` on main's tip, the merge base and `head`),
+        as self-tested bump eligibility runs it. Raises `GitHubUnavailable` when its inputs could not
+        be read, so the evaluation stays pending rather than deciding either way."""
+        from tauceti_tools.self_tested import _bump_policy, _ReadAPI
+
+        verdict, output = _bump_policy().check_bump(_ReadAPI(lambda path: self.client.get_json(path)[1]), repo, head)
+        if verdict is None:
+            raise ports.GitHubUnavailable(f"bump-guard for {head[:12]}: {output}"[:300])
+        return bool(verdict)
+
+    def admission_snapshot_single(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
+        """The same snapshot as `admission_snapshot`, from one GraphQL read (decision 38 step 4, slice 5).
+
+        One response carries the PR, its labels, every comment and the head's statuses, so no
+        separate fence is needed for them; the merge base and paths come from the clone. A PR whose
+        read cannot be complete in one response (over 100 comments or labels), whose head commit
+        does not match, or whose merge base the clone cannot vouch for, takes the full read. Live
+        self-tested reads (membership, bump guard) happen after the response, so a self-tested
+        request is fenced again exactly as the full read fences.
+        """
+        owner, name = repo.split("/", 1)
+        data = self.client.graphql(SINGLE_READ_QUERY, {"owner": owner, "name": name, "number": number})
+        node = (data.get("repository") or {}).get("pullRequest")
+        if not isinstance(node, dict):
+            raise GitHubError("incomplete single admission read")
+        labels, connection = node.get("labels") or {}, node.get("comments") or {}
+        commits = (node.get("commits") or {}).get("nodes") or []
+        commit = (commits[-1].get("commit") or {}) if commits else {}
+        head, base = node.get("headRefOid", ""), node.get("baseRefOid", "")
+        if (
+            not isinstance(labels.get("pageInfo"), dict)
+            or labels["pageInfo"].get("hasNextPage")
+            or not isinstance(connection.get("pageInfo"), dict)
+            or connection["pageInfo"].get("hasNextPage")
+            or not isinstance(connection.get("nodes"), list)
+            or commit.get("oid") != head
+        ):
+            return self._full_snapshot(repo, number, generation)
+        author = node.get("author") or {}
+        login = author.get("login", "") if node.get("author") is not None else "ghost"
+        if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
+            login += "[bot]"  # REST's login for an App, which self-tested bump checks compare
+        pull = PullRequest(
+            number=number,
+            head_sha=head,
+            base_ref=node.get("baseRefName", ""),
+            title=node.get("title") or "",
+            body=node.get("body") or "",
+            author_login=login,
+            state="open" if node.get("state") == "OPEN" else "closed",
+            draft=bool(node.get("isDraft")),
+            labels=tuple(s["name"] for s in labels.get("nodes", ())),
+            base_sha=base,
+            author_id=int(author.get("databaseId") or 0),
+            head_repo=((node.get("headRepository") or {}).get("nameWithOwner")) or "",
+            head_ref=node.get("headRefName") or "",
+            merged=bool(node.get("merged")),
+            updated_at=node.get("updatedAt") or "",
+            comments_count=connection.get("totalCount", 0),
+        )
+        if pull.state != "open" or pull.draft:
+            self.snapshot_sources["single"] += 1
+            return ports.AdmissionSnapshot(pull, "", (), (), {})
+        if not self.clone_dir or not SHA.fullmatch(head) or not SHA.fullmatch(base):
+            raise GitHubError("admission needs a clone and complete head/target identities")
+        missing = [sha for sha in (base, head) if not chain.object_exists(self.clone_dir, sha)]
+        if missing:
+            self.fetch_refs(repo, missing)
+        chain.git(self.clone_dir, "update-ref", f"{chain.REF_NAMESPACE}/admission/{number}", head)
+        merge_base = self._local_merge_base(base, head)
+        if merge_base is None:
+            return self._full_snapshot(repo, number, generation)
+        comments = tuple(_graphql_comment(comment) for comment in connection["nodes"])
+        paths = self._admission_paths(merge_base, head)
+        local, guard, exempt = self._self_tested(repo, number, pull, paths, merge_base)
+        statuses = {
+            s["context"]: str(s.get("state") or "").lower()
+            for s in (commit.get("status") or {}).get("contexts", ())
+            if s.get("context") in ("build", "scope", "bump-guard", f"self-tested/{number}")
+        }
+        from tauceti_tools.self_tested import requested
+
+        if requested(pull.labels) or exempt:
+            # Membership and bump reads came after the response: fence them as the full read does.
+            fresh, statuses = self._admission_fence(repo, number, pull)
+            if (fresh.head_sha, fresh.base_sha, fresh.base_ref, fresh.state, fresh.draft, sorted(fresh.labels)) != (
+                pull.head_sha,
+                pull.base_sha,
+                pull.base_ref,
+                pull.state,
+                pull.draft,
+                sorted(pull.labels),
+            ) or (fresh.body, fresh.comments_count, _timestamp(fresh.updated_at)) != (
+                pull.body,
+                pull.comments_count,
+                _timestamp(pull.updated_at),
+            ):
+                raise GitHubError("PR inputs changed while admission was reading source evidence")
+        self.snapshot_sources["single"] += 1
+        self.merge_base_sources["local"] = self.merge_base_sources.get("local", 0) + 1
+        return ports.AdmissionSnapshot(
+            pull,
+            merge_base,
+            paths,
+            comments,
+            statuses,
+            self._diff_version(base, head),
+            self_tested=local,
+            diff_guard=guard,
+            large_refactor=exempt,
+        )
+
+    def _full_snapshot(self, repo, number, generation):
+        self.snapshot_sources["full"] += 1
+        return self.admission_snapshot(repo, number, generation=generation)
 
     def admission_snapshot(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """Read complete current inputs and the exact reviewed diff; never run a PR's code."""
@@ -1127,51 +1503,30 @@ class GitHubAdapter:
             self.fetch_refs(repo, missing)
         # The pending head stays reachable across local GC until it is replaced or closed.
         chain.git(self.clone_dir, "update-ref", f"{chain.REF_NAMESPACE}/admission/{number}", pull.head_sha)
+        if progress.get("merge_base_source") == "local" and not self.local_merge_base:
+            # The setting was turned off while this read waited: compare answers, as it now must.
+            progress.pop("merge_base", None)
+            progress.pop("merge_base_source", None)
         if "merge_base" not in progress:
-            _, compare = self.client.get_json(
-                f"repos/{repo}/compare/{pull.base_sha}...{pull.head_sha}", params={"per_page": 1}
-            )
-            progress["merge_base"] = ((compare or {}).get("merge_base_commit") or {}).get("sha")
+            local = self._local_merge_base(pull.base_sha, pull.head_sha) if self.local_merge_base else None
+            if local is not None:
+                progress["merge_base"], progress["merge_base_source"] = local, "local"
+            else:
+                _, compare = self.client.get_json(
+                    f"repos/{repo}/compare/{pull.base_sha}...{pull.head_sha}", params={"per_page": 1}
+                )
+                progress["merge_base"] = ((compare or {}).get("merge_base_commit") or {}).get("sha")
+                progress["merge_base_source"] = "compare"
         merge_base = progress["merge_base"]
         if not isinstance(merge_base, str) or not SHA.fullmatch(merge_base):
             raise GitHubError("compare did not return a complete merge base")
         if not chain.object_exists(self.clone_dir, merge_base):
             self.fetch_refs(repo, [merge_base])
-        paths = tuple(
-            p
-            for p in chain.git(
-                self.clone_dir,
-                "diff",
-                "--name-only",
-                "-z",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--ignore-submodules=none",
-                merge_base,
-                pull.head_sha,
-                "--",
-            ).split("\0")
-            if p
-        )
+        paths = self._admission_paths(merge_base, pull.head_sha)
         comments = tuple(
             self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
         )
-        from tauceti_tools.self_tested import eligible, gh_read, requested
-
-        local = False
-        if requested(pull.labels):
-            raw = {
-                "number": number,
-                "state": pull.state,
-                "labels": pull.labels,
-                "base": {"ref": pull.base_ref},
-                "head": {"sha": pull.head_sha, "ref": pull.head_ref, "repo": {"full_name": pull.head_repo}},
-                "user": {"login": pull.author_login},
-            }
-            local = eligible(
-                raw, repo, paths=paths, read=lambda path: self.client.get_json(path)[1], member_read=gh_read
-            )
+        local, guard, exempt = self._self_tested(repo, number, pull, paths, merge_base)
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
         if (
             fresh.head_sha,
@@ -1197,6 +1552,8 @@ class GitHubAdapter:
             self._admission_reads.pop((repo, number), None)
             raise GitHubError("PR inputs changed while admission was reading source evidence")
         self._admission_reads.pop((repo, number), None)
+        source = progress.get("merge_base_source", "compare")
+        self.merge_base_sources[source] = self.merge_base_sources.get(source, 0) + 1
         return ports.AdmissionSnapshot(
             fresh,
             merge_base,
@@ -1205,6 +1562,8 @@ class GitHubAdapter:
             statuses,
             self._diff_version(pull.base_sha, pull.head_sha),
             self_tested=local,
+            diff_guard=guard,
+            large_refactor=exempt,
         )
 
     def _admission_fence(self, repo, number, pull, *, labels_progress=None):
@@ -1254,6 +1613,8 @@ class GitHubAdapter:
 
     def _admission_pulls(self, repo, on_page):
         owner, name = repo.split("/", 1)
+        if repo not in self._admission_listing:
+            self._refresh_git_caches()
         progress = self._admission_listing.setdefault(
             repo, {"listed": [], "cursor": None, "connection": None, "index": 0, "batch": []}
         )
@@ -1304,7 +1665,7 @@ class GitHubAdapter:
         number, head, base = node["number"], node.get("headRefOid", ""), node.get("baseRefOid", "")
         # Fetch a new target once, so a normal canonical advance doesn't invalidate every
         # unchanged review. PR heads are fetched only when evaluating new/dirty work.
-        if self.clone_dir and SHA.fullmatch(base) and not chain.object_exists(self.clone_dir, base):
+        if self.clone_dir and SHA.fullmatch(base) and not self._has_commit(base):
             self.fetch_refs(repo, [base])
         comments = self._admission_comments(repo, number, node.get("comments"))
         label_connection = node.get("labels") or {}
@@ -1351,24 +1712,7 @@ class GitHubAdapter:
             if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
                 raise GitHubError("incomplete review comments")
             for comment in connection["nodes"]:
-                if not isinstance(comment, dict) or not isinstance(comment.get("databaseId"), int):
-                    raise GitHubError("incomplete review comment")
-                author = comment.get("author") or {}
-                login = author.get("login", "")
-                # GraphQL Bot.login omits REST's suffix. Preserve the same actor identity
-                # for trusted recovery holds and stable source versions across both APIs.
-                if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
-                    login += "[bot]"
-                comments.append(
-                    {
-                        "id": comment["databaseId"],
-                        "body": comment.get("body", ""),
-                        "created_at": comment.get("createdAt", ""),
-                        "updated_at": comment.get("updatedAt", ""),
-                        "html_url": comment.get("url", ""),
-                        "author": login,
-                    }
-                )
+                comments.append(_graphql_comment(comment))
             page = connection.get("pageInfo")
             if not isinstance(page, dict) or (page.get("hasNextPage") and not page.get("endCursor")):
                 raise GitHubError("incomplete review comment pagination")
@@ -1383,6 +1727,77 @@ class GitHubAdapter:
                 ADMISSION_COMMENTS_QUERY, {"owner": owner, "name": name, "number": number, "after": cursor}
             )
             connection = ((data.get("repository") or {}).get("pullRequest") or {}).get("comments")
+
+    def admission_insertion_source(self, repo: str, number: int, head: str) -> dict:
+        """See `_insertion_source`. A read that needed more than one page is repeated and must come
+        back the same, so a scoreboard edited while later pages loaded cannot pass unseen."""
+        source, pages = self._insertion_source(repo, number, head)
+        if pages > 1:
+            again, _ = self._insertion_source(repo, number, head)
+            if again != source:
+                raise GitHubError("PR inputs changed while the insertion check was reading them")
+        return source
+
+    def _insertion_source(self, repo: str, number: int, head: str) -> tuple[dict, int]:
+        """The PR's admission inputs now, in the shape `admission.source_version` digests, for the
+        check before an approved head joins a batch (decision 38 step 4, slice 3).
+
+        One GraphQL read (plus pages for PRs with over 100 comments or labels), at essential
+        priority: it guards insertion, like the final fence guards evaluation. Every comment is
+        read, so a scoreboard edited or deleted since evaluation changes the result.
+        """
+        owner, name = repo.split("/", 1)
+        with self.client.deferred_requests(urgent=True):
+            data = self.client.graphql(
+                INSERTION_CHECK_QUERY, {"owner": owner, "name": name, "number": number, "head": head}
+            )
+            repository = data.get("repository") or {}
+            node, commit = repository.get("pullRequest"), repository.get("object")
+            if not isinstance(node, dict) or not isinstance(commit, dict) or commit.get("oid") != head:
+                raise GitHubError("incomplete insertion check")
+            labels = node.get("labels") or {}
+            if not isinstance(labels.get("pageInfo"), dict):
+                raise GitHubError("incomplete insertion check labels")
+            pages = 1 + bool(labels["pageInfo"].get("hasNextPage"))
+            names = (
+                self.labels(repo, number)
+                if labels["pageInfo"].get("hasNextPage")
+                else [s["name"] for s in labels.get("nodes", ())]
+            )
+            comments, connection = [], node.get("comments")
+            while True:
+                if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+                    raise GitHubError("incomplete insertion check comments")
+                comments.extend(_graphql_comment(comment) for comment in connection["nodes"])
+                page = connection.get("pageInfo")
+                if not isinstance(page, dict) or (page.get("hasNextPage") and not page.get("endCursor")):
+                    raise GitHubError("incomplete insertion check comment pagination")
+                if not page.get("hasNextPage"):
+                    break
+                pages += 1
+                more = self.client.graphql(
+                    ADMISSION_COMMENTS_QUERY,
+                    {"owner": owner, "name": name, "number": number, "after": page["endCursor"]},
+                )
+                connection = ((more.get("repository") or {}).get("pullRequest") or {}).get("comments")
+        statuses = {
+            s["context"]: str(s.get("state") or "").lower()
+            for s in (commit.get("status") or {}).get("contexts", ())
+            if s.get("context") in ("build", "scope", "bump-guard", f"self-tested/{number}")
+        }
+        source = {
+            "head": node.get("headRefOid", ""),
+            "base_sha": node.get("baseRefOid", ""),
+            "base_ref": node.get("baseRefName", ""),
+            "state": str(node.get("state") or "").lower(),
+            "draft": bool(node.get("isDraft")),
+            "body": node.get("body") or "",
+            "labels": names,
+            "comments": comments,
+            "statuses": statuses,
+            "diff_version": self._diff_version(node.get("baseRefOid", ""), node.get("headRefOid", "")),
+        }
+        return source, pages
 
     def list_open_pull_requests(
         self, repo: str, *, review_app_id: int, admission=False, on_page=None
@@ -1537,6 +1952,16 @@ class GitHubAdapter:
         """Bors's reviewer check: a collaborator with push access."""
         return self.collaborator_permission(repo or self.repo, login) in REVIEWER_PERMISSIONS
 
+    def app_credentials(self) -> github_app.AppCredentials | None:
+        """The App credentials this adapter mints installation tokens with, when it has them."""
+        credentials = getattr(self._tokens, "credentials", None)
+        return credentials if isinstance(credentials, github_app.AppCredentials) else None
+
+    def local_worker_login(self) -> str | None:
+        """The login a co-located repair worker's `github_app.local_worker_bearer` resolves to."""
+        credentials = self.app_credentials()
+        return github_app.local_worker_login(credentials) if credentials is not None else None
+
     def user_for_token(self, token: str) -> tuple[str, int] | None:
         """The login and id a bearer token authenticates as, or None when GitHub rejects it (401).
 
@@ -1639,6 +2064,66 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
 }
 """
 )
+
+
+SINGLE_READ_QUERY = (
+    """
+query($owner: String!, $name: String!, $number: Int!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid headRefName baseRefOid baseRefName state isDraft merged body title updatedAt
+      headRepository { nameWithOwner }
+      author { __typename login ... on User { databaseId } ... on Bot { databaseId } }
+      labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
+      comments(first: 100) { totalCount """
+    + ADMISSION_COMMENT_FIELDS
+    + """ }
+      commits(last: 1) { nodes { commit { oid status { contexts { context state } } } } }
+    }
+  }
+}
+"""
+)
+
+INSERTION_CHECK_QUERY = (
+    """
+query($owner: String!, $name: String!, $number: Int!, $head: GitObjectID!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid baseRefOid baseRefName state isDraft body
+      labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
+      comments(first: 100) { """
+    + ADMISSION_COMMENT_FIELDS
+    + """ }
+    }
+    object(oid: $head) { ... on Commit { oid status { contexts { context state } } } }
+  }
+}
+"""
+)
+
+
+def _graphql_comment(comment) -> dict:
+    """A GraphQL issue comment in the REST-like shape admission reads."""
+    if not isinstance(comment, dict) or not isinstance(comment.get("databaseId"), int):
+        raise GitHubError("incomplete review comment")
+    author = comment.get("author") or {}
+    # A deleted account: GraphQL returns no author where REST names the placeholder `ghost`.
+    login = author.get("login", "") if comment.get("author") is not None else "ghost"
+    # GraphQL Bot.login omits REST's suffix. Preserve the same actor identity
+    # for trusted recovery holds and stable source versions across both APIs.
+    if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
+        login += "[bot]"
+    return {
+        "id": comment["databaseId"],
+        "body": comment.get("body", ""),
+        "created_at": comment.get("createdAt", ""),
+        "updated_at": comment.get("updatedAt", ""),
+        "html_url": comment.get("url", ""),
+        "author": login,
+    }
 
 
 def _rest_check_run(run: dict, head_sha: str, app_id) -> dict:

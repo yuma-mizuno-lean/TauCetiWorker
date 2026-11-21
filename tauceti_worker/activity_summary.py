@@ -145,13 +145,18 @@ def display(value, default_kinds=()):
         ]
         rounds.append(("  " + kind, counts))
     rounds.append(("    failed/timed out", [sum(r["failed"] for r in s["rounds"][w].values()) for w in report_windows]))
+    closed = [sum(r.get("closed", 0) for r in s["rounds"][w].values()) for w in report_windows]
+    if any(closed):
+        rounds.append(("    closed own PR", closed))
     unconfirmed = [sum(r.get("unknown", 0) for r in s["rounds"][w].values()) for w in report_windows]
     if any(unconfirmed):
         rounds.append(("    outcome unconfirmed", unconfirmed))
     prs = []
     for key, label in (
         ("authored", "PRs authored"),
+        ("authored_forgejo", "  on Forgejo"),
         ("landed", "Authored PRs landed"),
+        ("landed_forgejo", "  from Forgejo"),
         ("assisted", "PRs assisted"),
         ("reviews", "Reviews completed"),
     ):
@@ -505,8 +510,10 @@ def combine(values):
                 continue
             for kind, counts in types.items():
                 row = s["rounds"][w].setdefault(kind, dict(finished=0, failed=0, unknown=0))
-                for key in row:
+                for key in ("finished", "failed", "unknown"):
                     row[key] += counts.get(key, 0)
+                if counts.get("closed"):
+                    row["closed"] = row.get("closed", 0) + counts["closed"]
     cleanup = [v["storage_cleanup"] for v in known if v.get("storage_cleanup")]
     if cleanup:
         s["storage_cleanup"] = dict(
@@ -539,6 +546,10 @@ def combine(values):
     for w in report_windows:
         for key in ("authored", "landed", "reviews", "fixes"):
             s["pr_windows"][w][key] = sum(v["pr_windows"][w].get(key, 0) for v in known)
+        for key in ("authored_forgejo", "landed_forgejo"):
+            # Hosts whose collector predates the forge breakdown leave it unknown, not zero.
+            counts = [v["pr_windows"][w].get(key) for v in known]
+            s["pr_windows"][w][key] = None if None in counts else sum(counts)
         # Unique assisted PR counts are per-host; review events are additive.
         s["pr_windows"][w]["assisted"] = known[0]["pr_windows"][w].get("assisted") if len(known) == 1 else None
     for w in cost_windows:

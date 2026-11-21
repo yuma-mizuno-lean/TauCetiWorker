@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -21,6 +22,7 @@ sys.path.insert(0, str(REPO))
 from tauceti_queue import chain, diagnostics, feeds  # noqa: E402
 from tauceti_queue.controller import (  # noqa: E402
     DEFAULT_SETTINGS,
+    LIVE_PROGRESS_SECONDS,
     LOG_GRACE_SECONDS,
     LOST_IN_PROGRESS,
     MERGED_TITLE_PREFIX,
@@ -29,6 +31,7 @@ from tauceti_queue.controller import (  # noqa: E402
     ControllerError,
     ControllerLock,
     TaskError,
+    live_progress_at,
 )
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.ports import AGENT_INSTRUCTION  # noqa: E402
@@ -61,30 +64,17 @@ class ControllerCase(unittest.TestCase):
 
 
 class RepairCheckOwnership(ControllerCase):
-    def claimed_repair(self, diagnostic):
+    def test_claims_name_no_check_owner(self):
+        """Every worker verification runs the complete check set; no claim hands checks to staging."""
         self.approve(101, {"A.lean": "a\n"})
         self.controller.tick()
         head = self.controller._head()
-        self.controller._create_task(head, "repair", head["base"], [diagnostic], self.clock())
-        return self.controller.claim_task("worker", "admin-worker")
-
-    def test_a_diagnosed_audit_repair_runs_checks_before_resubmission(self):
-        task = self.claimed_repair({"kind": "audit", "module": "TauCeti.A", "message": "import collision"})
-        self.assertEqual(task.extra["checks_owner"], "worker")
-        self.controller.renew_task(task.task_id, task.claim_token)
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
-
-    def test_a_diagnosed_lint_repair_runs_checks_before_resubmission(self):
-        task = self.claimed_repair({"kind": "lint", "module": "TauCeti.A", "message": "unused hypothesis"})
-        self.assertEqual(task.extra["checks_owner"], "worker")
-
-    def test_compiler_only_repairs_still_defer_full_checks_to_staging(self):
-        task = self.claimed_repair({"kind": "compiler", "module": "TauCeti.A", "message": "type mismatch"})
-        self.assertEqual(task.extra["checks_owner"], "staging")
-
-    def test_admission_predictions_do_not_require_a_second_full_check(self):
-        task = self.claimed_repair({"kind": "admission_predictions", "proactive": True, "records": []})
-        self.assertEqual(task.extra["checks_owner"], "staging")
+        for kind in ("compiler", "audit", "lint"):
+            diagnostic = {"kind": kind, "module": "TauCeti.A", "message": "finding"}
+            self.controller._create_task(head, "repair", head["base"], [diagnostic], self.clock())
+            task = self.controller.claim_task("worker", "admin-worker")
+            self.assertNotIn("checks_owner", task.extra)
+            self.controller.release_task(task.task_id, task.claim_token, "released")
 
 
 class DeclarationNames(ControllerCase):
@@ -376,6 +366,136 @@ class Verdicts(ControllerCase):
         self.assertEqual(task["kind"], "repair")
         self.assertEqual(json.loads(task["diagnostics"]), findings[:1])
         self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
+
+    def oom_findings(self, *located):
+        return diagnostics.parse_log(
+            [
+                *located,
+                "error: Lean process for /work/pr/TauCeti/A/B.lean was killed by signal 9 after 712s, likely out of memory",
+                "Some required targets logged failures:",
+                "- TauCeti.A.B",
+                "error: build failed",
+            ]
+        )
+
+    def test_lean_killed_out_of_memory_is_an_infrastructure_failure(self):
+        self.github.ci_policy = lambda *_: ("fail", self.oom_findings())
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+
+    def test_lean_killed_out_of_memory_beside_a_compiler_error_creates_repair(self):
+        findings = self.oom_findings("TauCeti/C.lean:3:4: error: unknown identifier 'x'")
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "repair")
+        self.assertEqual(
+            [(f["kind"], f["module"]) for f in json.loads(task["diagnostics"])], [("compiler", "TauCeti.C")]
+        )
+
+    def test_bound_failure_with_failed_finalizer_and_no_parsed_finding_creates_repair(self):
+        # The finalizer exits 1 after posting build=failure; a bound failed status is a source verdict
+        # even when no log line parses into a finding.
+        findings = diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "pr-build / finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "repair")
+        [finding] = json.loads(task["diagnostics"])
+        self.assertEqual(finding["kind"], "status")
+        self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
+
+    def test_incomplete_sandboxed_build_with_failed_finalizer_is_infrastructure(self):
+        # The `sandboxed-build` runner was OOM-killed before its report step (attempt 278): the
+        # finalizer posts a bound failed `build` saying the build did not complete, then exits 1.
+        findings = diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("incomplete", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        attempt = self.attempt(head)
+        self.assertEqual(attempt["outcome"], "infrastructure")
+        self.assertIn("did not complete", attempt["outcome_detail"])
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+        self.github.ci_policy = lambda *_: ("pass", [])
+        self.clock.advance(self.controller.setting("infrastructure_retry_backoff_seconds") + 1)
+        self.controller.tick()
+        self.assertEqual(len(self.github.dispatches), 2, "an incomplete build is re-dispatched")
+
+    def test_failed_build_verdict_with_compiler_finding_stays_source_failure(self):
+        # The same failed finalizer, but the build reported its own verdict: a source failure.
+        findings = diagnostics.parse_log(["TauCeti/A.lean:1:0: error: unknown identifier 'x'"])
+        self.assertEqual(findings[0]["kind"], "compiler")
+        findings += diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        self.assertEqual(self.controller.store.row("tasks", {"batch_id": head["id"]})["kind"], "repair")
+
+    def test_dependency_audit_collision_with_failed_finalizer_creates_repair(self):
+        findings = diagnostics.parse_log(
+            [
+                "audit-driver: import TauCeti.Topology.Algebra.Algebra.Unitization failed, environment already "
+                "contains 'Unitization.continuous_iff' from Mathlib.Analysis.Normed.Algebra.Unitization"
+            ]
+        )
+        findings += diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(json.loads(task["diagnostics"]), findings[:1])
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_bound_failure_with_another_infrastructure_finding_stays_infrastructure(self):
+        findings = diagnostics.infrastructure_findings(
+            {"conclusion": "failure"},
+            [
+                {"name": "sandboxed-build", "conclusion": "timed_out"},
+                {"name": "finalize-merge-group-build", "conclusion": "failure"},
+            ],
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
 
     def test_an_unrelated_cancelled_job_does_not_skip_publication_grace(self):
         self.github.ci_policy = lambda *_: (
@@ -990,6 +1110,184 @@ class LostRuns(ControllerCase):
         self.assertGreater(attempt["last_progress_at"], before + 2 * threshold)
         self.assertEqual(self.controller.status()["head"]["ci"]["updated_at"], self.github.runs[0].updated_at)
 
+    def live_reports(self):
+        """An inline background thread and a report whose counters last advanced at `advanced["at"]`."""
+        from datetime import UTC, datetime
+
+        from tauceti_queue import controller as controller_module
+
+        class Inline:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        iso = lambda t: datetime.fromtimestamp(t, UTC).isoformat().replace("+00:00", "Z")  # noqa: E731
+        advanced = {"at": None, "observed": None}
+        reads = []
+
+        def live(run_id, run_attempt):
+            reads.append((run_id, run_attempt))
+            if advanced["at"] is None:
+                return None
+            observed = advanced["observed"] if advanced["observed"] is not None else self.clock()
+            return {"completed_tasks": 1000, "observed_at": iso(observed), "last_progress_at": iso(advanced["at"])}
+
+        self.controller.live_progress = live
+        return advanced, reads, mock.patch.object(controller_module.threading, "Thread", Inline)
+
+    def test_advancing_live_build_counts_hold_off_the_stall_until_they_stop(self):
+        # A staging build step lasts hours with no step change; its live Lake counts still move.
+        advanced, reads, inline = self.live_reports()
+        self.github.start_runs()
+        with inline:
+            self.observe()
+            run = self.attempt()
+            interval = self.controller.setting("stall_interval_seconds")
+            for _ in range(4):
+                self.clock.advance(300)
+                advanced["at"] = self.clock() - 5
+                self.observe(1)
+                self.assertIsNone(self.controller.status()["head"]["stall"])
+            self.assertGreater(self.clock() - run["last_progress_at"], interval, "the step phases alone would stall")
+            self.assertEqual(reads[-1], (str(run["run_id"]), run["run_attempt"] or 1))
+            # The counts stop: a stall from their last advance.
+            stopped = advanced["at"]
+            self.observe(interval)
+            stall = self.controller.status()["head"]["stall"]
+            self.assertEqual(stall["since"], stopped + interval)
+            # A report that stops coming, or fails, never moves the time back.
+            self.controller.live_progress = mock.Mock(side_effect=OSError("down"))
+            self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertEqual(self.controller.status()["head"]["stall"]["since"], stopped + interval)
+        self.assertEqual(self.attempt()["outcome"], "pending")
+
+    def test_live_counts_are_read_while_github_is_unavailable_and_survive_a_restart(self):
+        advanced, _reads, inline = self.live_reports()
+        self.github.start_runs()
+        interval = self.controller.setting("stall_interval_seconds")
+        with inline:
+            self.observe()
+            with mock.patch.object(type(self.controller), "_fetch_canonical", side_effect=OSError("git down")):
+                for _ in range(4):
+                    self.clock.advance(300)
+                    advanced["at"] = self.clock() - 5
+                    self.observe(1)
+                    self.assertIsNone(self.controller.status()["head"]["stall"])
+            self.observe(1)  # persists the watermark on the reconciliation thread
+            last = advanced["at"]
+            restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+            restarted.live_progress = mock.Mock(side_effect=OSError("ci-data down"))
+            restarted.tick()
+            self.assertIsNone(restarted.status()["head"]["stall"])
+            self.clock.advance(last + interval - self.clock())
+            self.assertEqual(restarted.status()["head"]["stall"]["since"], last + interval)
+
+    def test_a_frozen_report_from_a_fast_clock_does_not_renew_progress(self):
+        advanced, _reads, inline = self.live_reports()
+        self.github.start_runs()
+        interval = self.controller.setting("stall_interval_seconds")
+        with inline:
+            self.observe()
+            start = self.clock()
+            # Slightly ahead of this clock: believed, but capped once, when first seen.
+            advanced.update(at=start + 120, observed=start + 120)
+            self.observe(LIVE_PROGRESS_SECONDS)
+            first_seen = self.clock()
+            for _ in range(3):
+                self.observe(LIVE_PROGRESS_SECONDS)
+            self.clock.advance(first_seen + interval - self.clock())
+            self.assertEqual(self.controller.status()["head"]["stall"]["since"], first_seen + interval)
+            # Far ahead: not believed at all.
+            advanced.update(at=self.clock() + 86400, observed=self.clock() + 86400)
+            self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertEqual(self.controller.status()["head"]["stall"]["since"], first_seen + interval)
+
+    def test_a_slow_read_never_blocks_the_tick_or_lands_out_of_order(self):
+        self.github.start_runs()
+        self.observe()
+        release, started = threading.Event(), threading.Event()
+        calls = []
+
+        def slow(run_id, run_attempt):
+            calls.append(run_id)
+            started.set()
+            release.wait(10)
+            return None
+
+        self.controller.live_progress = slow
+        self.observe(LIVE_PROGRESS_SECONDS)
+        self.assertTrue(started.wait(5))
+        # Ticks and status go on while the read is blocked, and no second read starts.
+        self.observe(LIVE_PROGRESS_SECONDS)
+        self.assertIsNotNone(self.controller.status()["head"])
+        self.assertEqual(len(calls), 1)
+        release.set()
+        for _ in range(100):
+            if not self.controller._live_reading:
+                break
+            time.sleep(0.01)
+        self.assertFalse(self.controller._live_reading)
+
+    def test_failing_reads_are_logged_once_and_their_recovery_too(self):
+        advanced, _reads, inline = self.live_reports()
+        self.github.start_runs()
+        advanced["at"] = self.clock()
+        with inline:
+            self.observe()
+            outcomes = iter([RuntimeError("HTTP 403: blocked"), OSError("timed out"), None, RuntimeError("HTTP 500")])
+
+            def failing(run_id, run_attempt):
+                outcome = next(outcomes)
+                if outcome is not None:
+                    raise outcome
+                return None
+
+            working = self.controller.live_progress
+            self.controller.live_progress = failing
+            with self.assertLogs(self.controller.log, "WARNING") as logged:
+                for _ in range(4):
+                    self.observe(LIVE_PROGRESS_SECONDS)
+            # Different errors and a missing report within one outage: still one line.
+            self.assertEqual(len([m for m in logged.output if "unavailable" in m]), 1, logged.output)
+            self.controller.live_progress = working
+            advanced["at"] = self.clock()
+            with self.assertLogs(self.controller.log, "INFO") as logged:
+                self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertTrue(any("readable again" in m for m in logged.output))
+
+    def test_a_failed_watermark_write_does_not_stop_polling(self):
+        advanced, reads, inline = self.live_reports()
+        self.github.start_runs()
+        with inline:
+            self.observe()
+            advanced["at"] = self.clock()
+            self.observe(LIVE_PROGRESS_SECONDS)
+            store = self.controller.store
+            with mock.patch.object(store, "set_setting", side_effect=sqlite3.OperationalError("locked")):
+                self.controller._read_live_progress(self.clock() + LIVE_PROGRESS_SECONDS)
+            self.assertFalse(self.controller._live_reading)
+            count = len(reads)
+            self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertGreater(len(reads), count)
+
+    def test_live_progress_time_ignores_reports_without_counts_or_from_the_future(self):
+        self.assertEqual(live_progress_at(None, 100), (None, None))
+        self.assertEqual(live_progress_at({"completed_tasks": None, "observed_at": "x"}, 100), (None, None))
+        bad = {"completed_tasks": 1, "observed_at": "bad", "last_progress_at": "bad"}
+        self.assertEqual(live_progress_at(bad, 100), (None, None))
+        report = {
+            "completed_tasks": 1,
+            "observed_at": "1970-01-01T00:01:40Z",
+            "last_progress_at": "1970-01-01T00:03:20Z",
+        }
+        self.assertEqual(live_progress_at(report, 1000), ("1970-01-01T00:03:20Z", 100))
+        self.assertEqual(
+            live_progress_at(dict(report, observed_at="1970-01-01T00:04:00Z"), 150), ("1970-01-01T00:03:20Z", 150)
+        )
+        self.assertEqual(live_progress_at(report, 100 - 301 - 100), (None, None))
+
     def test_queued_run_is_never_lost(self):
         self.observe()
         reasons = self.observe(3 * self.controller.setting("lost_run_seconds"))
@@ -1189,27 +1487,48 @@ class SupersededRuns(ControllerCase):
         self.assertEqual(self.controller._active_claims(self.head["id"])[0]["task_id"], task.task_id)
         self.assertEqual(self.attempts()[0]["cancel_reason"], "canonical advanced; rebase waits for worker")
 
-    def test_a_failed_cancel_never_blocks_the_dispatch_and_is_retried_once(self):
-        self.github.fail_next["cancel_run"] = 5
+    def test_a_failed_cancel_never_blocks_the_dispatch_and_is_retried_until_settled(self):
+        self.github.fail_next["cancel_run"] = 3
         first, second = self.replay()
         self.assertEqual(len(self.github.dispatches), 2, "the new attempt was dispatched")
         self.assertEqual(second["dispatch_id"], "dispatch-2")
         self.assertEqual(first["outcome"], "superseded")
         self.assertTrue(first["cancel_result"].startswith("failed:"), first["cancel_result"])
+        intent = self.controller._cancel_intents()[first["id"]]
+        self.assertEqual(intent["tries"], 1)
+        self.assertGreater(intent["retry_at"], self.clock())
         for _ in range(4):
             self.observe(self.controller.setting("outbox_retry_max_seconds") + 1)
-        self.assertEqual(len(self.cancel_calls()), 2, "one inline call and one retry from the outbox")
-        entry = self.controller.store.row("outbox", {"kind": "cancel_run"})
-        self.assertEqual(entry["state"], "done")
-        self.assertTrue(entry["result"].startswith("gave-up:"), entry["result"])
+        self.assertEqual(len(self.cancel_calls()), 4, "one inline call, two failed retries and the one that settles")
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.attempts()[0]["cancel_result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
+        self.assertIsNone(self.controller.store.row("outbox", {"kind": "cancel_run"}))
         self.assertEqual(self.attempts()[1]["outcome"], "pending")
 
-    def test_a_failed_cancel_succeeds_on_its_outbox_retry(self):
+    def test_a_failed_cancel_backs_off_before_its_retry(self):
         self.github.fail_next["cancel_run"] = 1
         self.replay()
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertEqual(len(self.cancel_calls()), 1, "the retry waits out its backoff")
+        self.observe()
+        self.assertEqual(len(self.cancel_calls()), 2)
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.attempts()[0]["cancel_result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
+
+    def test_a_queued_outbox_cancel_that_fails_hands_over_to_a_cancel_intent(self):
+        # An entry enqueued by an earlier controller, which retried a failed cancel once through the outbox.
+        self.github.cancel_run = None
+        first, _second = self.replay()
+        del self.github.cancel_run
+        self.github.fail_next["cancel_run"] = 1
+        payload = {"run_id": first["run_id"], "attempt_id": first["id"]}
+        self.assertTrue(self.controller._perform("cancel_run", payload, self.clock()).startswith("cancel-intent:"))
+        self.assertIn(first["id"], self.controller._cancel_intents())
         self.observe()
         self.assertEqual(self.github.runs[0].conclusion, "cancelled")
-        self.assertEqual(self.controller.store.row("outbox", {"kind": "cancel_run"})["result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
 
     def test_a_landed_batch_cancels_a_straggler(self):
         # A controller unable to cancel at dispatch (as before this was added) leaves the old run going.
@@ -1364,32 +1683,162 @@ class PreRebase(ControllerCase):
         self.assertEqual(self.controller.claim_task("w", "admin-worker").kind, "pre_rebase")
         self.assertIsNone(batch["prepared_version"])
 
+    def test_the_next_heads_pre_rebase_takes_the_newest_later_preparations_slot(self):
+        """Background slots full of later batches' preparations: the next head's pre-rebase takes the
+        newest one's slot, and the slot kept for head work stays free."""
+        for name, value in (
+            ("repair_concurrency", 3),
+            ("background_start_limit", 3),
+            ("open_batch_limit", 3),
+            ("prepare_open_batches", False),
+        ):
+            self.controller.set_setting(name, value, "kim")
+        self.controller.set_setting("publication_enabled", False, "kim")  # holds the pre-rebase off
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.controller.tick()
+        for number in (102, 103, 104):  # each conflicts with the open batches before it
+            self.approve(number, {"Shared.lean": f"line one\nline two by {number}\nline three\n"})
+            self.controller.tick()
+        successor, later, last = self.controller.store.rows("batches", {"state": "open"}, order="id")
+        for batch in (later, last):
+            self.controller._create_task(batch, "prepare", batch["base"], [], self.clock())
+        first = self.controller.claim_task("w1", "admin-worker")
+        self.clock.advance(1)
+        second = self.controller.claim_task("w2", "admin-worker")
+        self.assertEqual(
+            {(first.kind, first.batch_id), (second.kind, second.batch_id)},
+            {("prepare", later["id"]), ("prepare", last["id"])},
+        )
+        self.controller.set_setting("publication_enabled", True, "kim")
+        self.controller.tick()
+        [pre_rebase] = [t for t in self.open_tasks(successor) if t["kind"] == "pre_rebase"]
+        third = self.controller.claim_task("w3", "admin-worker")
+        self.assertEqual((third.kind, third.task_id), ("pre_rebase", pre_rebase["id"]))
+        released = self.controller.store.row("tasks", {"id": second.task_id})
+        self.assertEqual((released["state"], released["resolution"]), ("superseded", "pre-rebase-first"))
+        self.assertEqual(
+            self.controller.store.row("tasks", {"id": first.task_id})["state"], "open", "the older one keeps its slot"
+        )
+        self.assertEqual(len(self.controller._active_task_claims()), 2, "the claims did not grow")
+        self.assertIsNone(self.controller.claim_task("w4", "admin-worker"), "the slot kept for head work stays free")
+        self.assertEqual(len(self.controller.store.journal_entries("pre-rebase-first")), 1)
+
     def test_background_checks_yield_when_the_predecessor_lands(self):
         self.conflicting_batch()
         task = self.controller.claim_task("w", "admin-worker")
         self.assertEqual(task.kind, "pre_rebase")
-        self.assertEqual(task.extra["checks_owner"], "worker")
-        self.assertEqual(self.controller.task_check_policy(task.task_id), {"checks_owner": "worker", "renew_after": 15})
+        self.assertEqual(task.extra["renew_after"], 15)
         self.github.complete_runs()
         for context in VERDICT_CONTEXTS:
             self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
         self.controller.tick()
         self.assertIsNone(self.controller._head(), "the source claim still owns the successor")
         self.controller.renew_task(task.task_id, task.claim_token)
+
+    def test_a_pre_rebase_in_flight_when_the_head_lands_is_what_the_next_head_seals_with(self):
+        """Its work is not lost: promotion waits for the claim, and the submitted chain, already on the
+        landed head's tip (now `main`), becomes the head without another rebase."""
+        self.conflicting_batch()
+        batch = self.open_batch()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {f"{PROJECT}#102": Resolution({"Shared.lean": resolved}, explanation="Kept both edits.")},
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        self.land_head()
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual((head["id"], head["base"]), (batch["id"], self.repo.main_sha()))
+        self.assertEqual(self.repo.file_at(head["tip"], "Shared.lean"), resolved)
         self.assertEqual(
-            self.controller.task_check_policy(task.task_id), {"checks_owner": "staging", "renew_after": 15}
+            self.controller.store.rows("tasks", {"batch_id": batch["id"], "kind": "rebase_conflict"}),
+            [],
+            "no new rebase",
         )
 
-    def test_background_checks_continue_while_head_selection_is_held(self):
-        self.conflicting_batch()
-        task = self.controller.claim_task("w", "admin-worker")
+    def batch_conflicting_in_the_middle(self):
+        """A head waiting on CI and an open batch [103, 102, 104] whose member 102 conflicts with it."""
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.controller.tick()
+        for number, files in (
+            (103, {"B.lean": "b\n"}),
+            (102, {"Shared.lean": "line one\nline two by 102\nline three\n"}),
+            (104, {"C.lean": "c\n"}),
+        ):
+            self.approve(number, files)
+            self.controller.tick()
+        batch = self.open_batch()
+        self.assertEqual([m["number"] for m in self.controller.members(batch["id"])], [103, 102, 104])
+        self.assertEqual(batch["pre_rebase_state"], "conflict")
+        return batch
+
+    def land_head(self):
         self.github.complete_runs()
         for context in VERDICT_CONTEXTS:
             self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
+        self.controller.tick()  # promotes the head
+        self.controller.tick()  # observes the landing and seals
+
+    def assert_clean_prefix_sealed(self, batch):
+        head = self.controller._head()
+        self.assertGreater(head["id"], batch["id"])
+        self.assertEqual([m["number"] for m in self.controller.members(head["id"])], [103])
+        self.assertEqual(head["base"], self.repo.main_sha())
+        self.assertEqual(self.repo.file_at(head["tip"], "B.lean"), "b\n")
+        self.assertEqual(len(self.github.runs), 2, "the clean prefix is dispatched in the same pass")
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["batch_id"], head["id"])
+        # The rest stays in the batch, still first in line, on the moved member's own commit.
+        left = self.controller._open_batch()
+        self.assertEqual(left["id"], batch["id"])
+        self.assertEqual((left["tip"], left["version"]), (batch["tip"], batch["version"] + 1))
+        self.assertEqual(
+            [(m["number"], m["position"]) for m in self.controller.members(left["id"])], [(102, 0), (104, 1)]
+        )
+        self.assertEqual(len(chain.chain_commits(self.repo.clone, left["base"], left["tip"])), 2)
+        for number in (102, 104):
+            row = self.controller.input_for(PROJECT, number)
+            self.assertEqual((row["state"], row["batch_id"]), ("inserted", batch["id"]))
+            self.assertEqual(self.github.comments_for(number), [])
+        [entry] = self.controller.store.journal_entries("clean-prefix-sealed")
+        self.assertEqual(
+            (entry["detail"]["kept"], entry["detail"]["left"], entry["detail"]["conflict"]),
+            ([103], [102, 104], f"{PROJECT}#102"),
+        )
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+        # Once the new head is dispatched the batch is replayed onto it and conflicts again.
         self.controller.tick()
-        self.assertIsNone(self.controller._head())
-        self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "held"})
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
+        task = self.controller.store.row("tasks", {"batch_id": batch["id"], "state": "open", "kind": "pre_rebase"})
+        self.assertEqual((task["onto"], task["base"]), (head["tip"], left["base"]))
+        return head
+
+    def test_a_claimed_pre_rebase_conflict_seals_the_clean_prefix_when_the_head_lands(self):
+        batch = self.batch_conflicting_in_the_middle()
+        task = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual(task.kind, "pre_rebase")
+        self.land_head()
+        self.assert_clean_prefix_sealed(batch)
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        self.assertEqual((row["state"], row["resolution"]), ("superseded", "clean-prefix"))
+        self.assertFalse(self.controller.submit_task(task.task_id, task.claim_token, task.tip).accepted)
+
+    def test_an_unclaimed_pre_rebase_conflict_seals_the_clean_prefix_too(self):
+        batch = self.batch_conflicting_in_the_middle()
+        self.land_head()
+        head = self.assert_clean_prefix_sealed(batch)
+        # The prefix lands; the batch then seals and its conflict is a `rebase_conflict` task.
+        self.land_head()
+        self.assertEqual(self.repo.file_at("main", "B.lean"), "b\n")
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertEqual(self.controller._head()["id"], batch["id"])
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 1)
 
     def test_verified_pre_rebase_needs_no_second_preparation(self):
         ref = "a" * 40
@@ -1409,7 +1858,6 @@ class PreRebase(ControllerCase):
         )
         task = agent.claim(self.controller)
         tip = agent.produce(task)
-        self.assertEqual(task.extra["checks_owner"], "worker")
         evidence = {"tip": tip, "base": task.onto, "tools": f"org/Tools@{ref}", "scope": "build"}
         row = self.controller.store.row("tasks", {"id": task.task_id})
         for stale in ({"tip": task.tip}, {"base": task.base}, {"tools": "org/Tools@" + "b" * 40}):
@@ -1466,15 +1914,10 @@ class PreRebase(ControllerCase):
         self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["prepare"], "one background kind per batch")
         task = self.controller.claim_task("w", "admin-worker")
         self.assertEqual(task.kind, "prepare")
-        self.assertEqual(task.extra["checks_owner"], "worker", "rebasing is not enabled yet")
         self.controller.set_setting("pre_rebase_enabled", True, "kim")
         self.controller.tick()
         self.assertEqual(self.open_batch()["pre_rebase_state"], "conflict")
         self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["prepare"])
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "staging")
-        self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "held"})
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
-        self.controller._set_state("inference_hold", None)
         # The preparation edits 102 (so the chain is rewritten) and reports an error it left.
         agent = ScriptedAgent(
             "preparer",
@@ -1513,19 +1956,6 @@ class PreRebase(ControllerCase):
         self.assertEqual((background["active"]["kind"], background["waiting"]), ("pre_rebase", None))
         rebasing = self.controller.claim_task("w", "admin-worker")
         self.assertEqual(rebasing.kind, "pre_rebase")
-        self.assertEqual(rebasing.extra["checks_owner"], "worker", "full checks resume on the rebased chain")
-
-    def test_old_base_checks_continue_when_the_head_is_not_ready_for_rebasing(self):
-        self.controller.set_setting("prepare_min_members", 1, "kim")
-        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
-        self.controller.set_setting("pre_rebase_enabled", False, "kim")
-        self.conflicting_batch()
-        task = self.controller.claim_task("w", "admin-worker")
-        self.assertEqual(task.kind, "prepare")
-        self.controller.set_setting("pre_rebase_enabled", True, "kim")
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "staging")
-        self.assertTrue(self.controller.rebuild_head(PROJECT, "kim")["rebuilt"])
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
 
     def test_a_pre_rebase_task_names_the_heads_tips_then_its_base_to_warm_from(self):
         self.conflicting_batch()
@@ -1684,6 +2114,15 @@ class Tasks(ControllerCase):
         self.assertEqual(refusals[-1]["detail"]["reason"], "github-unavailable")
         result = self.controller.submit_task(task.task_id, task.claim_token, head["tip"])
         self.assertTrue(result.accepted, "the submission's admin check serves the same stale answer")
+
+    def test_the_local_worker_login_claims_and_submits_without_a_github_admin_read(self):
+        head = self.failing_head()
+        self.controller.local_worker_login = "tauceti-queue[bot]"
+        self.github.unavailable = "rate limited for 2400s"
+        task = self.controller.claim_task("worker-1", "tauceti-queue[bot]")
+        self.assertIsNotNone(task, "the server resolves this login only from a bearer signed with the App's key")
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, head["tip"]).accepted)
+        self.assertEqual([c for c in self.github.calls if c[0] == "repository_admin"], [])
 
     def test_admin_answers_survive_a_restart_during_an_outage(self):
         self.failing_head()
@@ -1927,6 +2366,65 @@ class Preparation(ControllerCase):
         self.assertEqual((claimed.kind, claimed.batch_id, claimed.tip), ("prepare", batch["id"], batch["tip"]))
         self.assertEqual(claimed.extra["renew_after"], 15, "background checks promptly yield for head handoff")
         self.assertIsNone(self.controller.claim_task("worker-2", "admin-worker"), "within repair_concurrency")
+
+    def test_an_open_batch_behind_main_is_replayed_onto_it_before_it_is_prepared(self):
+        batch = self.open_batch()
+        main = self.repo.advance_main({"Admin.lean": "x\n"})
+        self.quiet()
+        self.controller.tick()
+        [task] = self.prepare_tasks()
+        rebased = self.controller.store.row("batches", {"id": batch["id"]})
+        self.assertEqual((rebased["base"], rebased["version"]), (main, batch["version"] + 1))
+        self.assertEqual((task["base"], task["onto"], task["tip"]), (main, main, rebased["tip"]))
+        self.assertEqual(task["batch_version"], rebased["version"])
+        self.assertEqual(
+            sorted(c.source_pr for c in chain.chain_commits(self.controller.clone, main, rebased["tip"])),
+            [f"{PROJECT}#201", f"{PROJECT}#202", f"{PROJECT}#203"],
+        )
+        self.assertEqual(len(self.controller.store.journal_entries("open-rebased")), 1)
+
+    def test_an_unclaimed_preparation_on_a_base_main_moved_past_is_superseded_and_not_offered(self):
+        self.open_batch()
+        self.quiet()
+        [stale] = self.prepare_tasks()
+        main = self.repo.advance_main({"Admin.lean": "x\n"})
+        self.controller.set_setting("prepare_open_batches", False, "t")
+        self.controller.tick()
+        self.assertEqual(self.controller.store.row("tasks", {"id": stale["id"]})["resolution"], "base-behind")
+        self.assertEqual(self.prepare_tasks(), [], "the setting off: no new preparation")
+        self.controller.set_setting("prepare_open_batches", True, "t")
+        self.controller.tick()
+        [task] = self.prepare_tasks()
+        self.assertEqual(task["base"], main)
+
+    def test_an_open_batch_whose_replay_onto_main_conflicts_is_not_prepared_on_its_old_base(self):
+        batch = self.open_batch()
+        main = self.repo.advance_main({"P201.lean": "main's own\n"})
+        self.quiet()
+        self.controller.tick()
+        self.assertEqual(self.prepare_tasks(), [])
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["base"], batch["base"])
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"]), ("rebase_conflict", main))
+        [diagnostic] = loads(task["diagnostics"])
+        self.assertEqual(diagnostic["source_pr"], f"{PROJECT}#201")
+        self.controller.tick()
+        self.assertEqual(len(self.controller.store.journal_entries("open-rebase-conflict")), 1, "replayed once")
+        self.assertTrue(
+            any("waits for a worker to resolve its rebase onto main" in r for r in self.controller.status()["reasons"])
+        )
+
+    def test_a_conflict_recorded_before_the_background_rebase_existed_still_gets_its_task(self):
+        batch = self.open_batch()
+        main = self.repo.advance_main({"P201.lean": "main's own\n"})
+        self.controller._set_state(
+            f"open_rebase_conflict:{batch['id']}",
+            {"version": batch["version"], "onto": main, "source_pr": f"{PROJECT}#201"},
+        )
+        self.quiet()
+        self.controller.tick()
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"]), ("rebase_conflict", main))
 
     def test_small_batches_and_the_setting_turned_off_get_no_prepare_task(self):
         self.controller.set_setting("prepare_min_members", 4, "t")
@@ -2272,7 +2770,6 @@ class PreRebasedPreparation(ControllerCase):
         ]
         claimed = self.controller.claim_task("worker-1", "admin-worker")
         self.assertIn("pre_rebased", claimed.extra)
-        self.assertEqual(claimed.extra["checks_owner"], "worker", "this preparation is already on its intended parent")
         self.assertEqual(claimed.warm_revs[:2], [head["tip"], "1" * 40], "the head's tip, then its previous tip")
         self.assertEqual(claimed.warm_revs[2], batch["tip"], "then the batch tip the pre-rebase covers")
         self.assertEqual(claimed.warm_revs[3:], [t for t in own_tips if t != batch["tip"]][:4])
@@ -2629,6 +3126,75 @@ class NoRepair(ControllerCase):
         self.assertEqual(self.controller.status()["anticipated"], [], "nothing to follow")
 
 
+class BlockingLabelAfterApproval(ControllerCase):
+    """A blocking label (`hold`, `wip`, ...) added to an approved PR keeps it out of batches until it goes."""
+
+    def label_event(self, number, action, name, labels, **pull):
+        self.github.labels[number] = set(labels)
+        self.controller.handle_event(
+            "pull_request",
+            {
+                "action": action,
+                "number": number,
+                "label": {"name": name},
+                "pull_request": {"number": number, "labels": [{"name": label} for label in labels], **pull},
+            },
+        )
+
+    def held(self, number):
+        row = self.controller.input_for(PROJECT, number)
+        return row["state"], json.loads(row["blocked_labels"])
+
+    def test_a_waiting_input_is_held_while_labelled_and_placed_once_it_goes(self):
+        head, result = self.approve(101, {"A.lean": "a\n"})
+        self.label_event(101, "labeled", "Hold", ["Hold"])
+        self.assertEqual(self.held(101), ("waiting", ["hold"]))
+        self.controller.tick()
+        self.assertEqual(self.controller.store.count("members"), 0, "a held input joins no batch")
+        self.assertEqual(self.controller.status()["waiting"]["inputs"][0]["blocked_labels"], ["hold"])
+        self.label_event(101, "labeled", "wip", ["Hold", "wip"])
+        self.label_event(101, "unlabeled", "Hold", ["wip"])
+        self.controller.tick()
+        self.assertEqual(self.held(101), ("waiting", ["wip"]), "wip still blocks")
+        self.label_event(101, "unlabeled", "wip", [])
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual((row["id"], row["approved_at"]), (result["input"]["id"], result["input"]["approved_at"]))
+        self.controller.tick()
+        self.assertEqual(self.held(101), ("inserted", []))
+
+    def test_a_delivery_without_a_label_list_applies_its_one_label(self):
+        self.approve(101, {"A.lean": "a\n"})
+        for action in ("labeled", "unlabeled"):
+            self.controller.handle_event(
+                "pull_request", {"action": action, "number": 101, "label": {"name": "wip"}, "pull_request": {}}
+            )
+            self.assertEqual(self.held(101), ("waiting", ["wip"] if action == "labeled" else []))
+
+    def test_a_label_arriving_during_the_probe_keeps_the_input_out(self):
+        self.approve(101, {"A.lean": "a\n"})
+        build = chain.build
+
+        def label_then_build(*args, **kwargs):
+            self.label_event(101, "labeled", "hold", ["hold"])
+            return build(*args, **kwargs)
+
+        with mock.patch.object(chain, "build", label_then_build):
+            self.controller.tick()
+        self.assertEqual(self.held(101), ("waiting", ["hold"]))
+        self.assertEqual(self.controller.store.count("members"), 0)
+
+    def test_a_member_is_not_withdrawn_by_a_blocking_label(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.label_event(101, "labeled", "hold", ["hold"])
+        self.assertEqual(self.held(101), ("inserted", ["hold"]), "kept in its batch, recorded should it return")
+
+    def test_a_delivery_for_another_head_is_ignored(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.label_event(101, "labeled", "hold", ["hold"], head={"sha": "f" * 40})
+        self.assertEqual(self.held(101), ("waiting", []))
+
+
 class EditSummary(ControllerCase):
     def test_a_long_diff_is_capped_with_a_note_and_the_commit_link(self):
         self.github.ci_policy = lambda *_: ("fail", [{"kind": "compiler", "module": "Long.lean", "message": "boom"}])
@@ -2754,6 +3320,7 @@ class StatusShape(ControllerCase):
                 "open_batches",
                 "sealed_successor",
                 "head",
+                "emergency",
                 "external_head",
                 "approvals",
                 "admission",
@@ -2762,6 +3329,9 @@ class StatusShape(ControllerCase):
                 "outbox",
                 "reasons",
                 "alerts",
+                "stuck_heads",
+                "escalations",
+                "loop_termination",
                 "counters",
                 "head_cycle_seconds",
                 "insertion_passes",
@@ -2770,6 +3340,9 @@ class StatusShape(ControllerCase):
         )
         self.assertIsNone(status["head"])
         self.assertIsNone(status["external_head"])
+        self.assertEqual(
+            status["emergency"], {"enabled": False, "evict": False, "batch": None, "queued": [], "cancel_intents": []}
+        )
         self.assertEqual(status["approvals"], {"webhook": 0, "polled": 0, "revoked_by_poll": 0, "last_poll": None})
         self.assertEqual(status["waiting"]["count"], 0)
         self.approve(101, {"A.lean": "a\n"})

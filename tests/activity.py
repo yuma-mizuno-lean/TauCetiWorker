@@ -351,6 +351,17 @@ class ActivityTests(unittest.TestCase):
         a.prepare(now=self.now)
         self.assertEqual(a.cached()["summary"]["rounds"], s["rounds"])
 
+    def test_own_pr_closure_is_a_finished_round_and_not_a_failure(self):
+        self.finish(10, kind="rebase", outcome="closed-by-agent")
+        self.finish(20, kind="rebase", outcome="failed")
+        a.prepare(now=self.now)
+        s = a.cached(group="machine")["summary"]
+        self.assertEqual(s["rounds"]["1h"]["rebase"], dict(finished=2, failed=1, unknown=0, closed=1))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(a.cached(group="machine"))
+        self.assertRegex(output.getvalue(), r"\n    failed/timed out +1 ")
+        self.assertRegex(output.getvalue(), r"\n    closed own PR +1 ")
+
     def test_round_lifecycle_selection_no_work_waits_and_interruption(self):
         r = a.Round("worker")
         r.select("roadmap")
@@ -542,6 +553,13 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(len(receipts), 1)
         self.assertNotIn("round_id", receipts[0])
 
+    def test_closing_an_already_closed_pr_is_not_a_closure(self):
+        close = {"argv": ["pr", "close", "7", "--repo", "org/repo"]}
+        fleet_events.mutation(close, SimpleNamespace(stdout="", stderr="! Pull request org/repo#7 is already closed"))
+        fleet_events.mutation(close, SimpleNamespace(stdout="", stderr="✓ Closed pull request org/repo#7"))
+        receipts = [json.loads(p.read_text()) for p in (a.root() / "pending").glob("*.json")]
+        self.assertEqual(sorted(str(r.get("publication")) for r in receipts), ["None", "closure"])
+
     def test_pr_creation_is_recorded_without_fleet_journal(self):
         with patch.dict(os.environ, {"TAUCETI_FLEET_EVENTS": ""}):
             fleet_events.mutation(
@@ -552,6 +570,59 @@ class ActivityTests(unittest.TestCase):
         s = a.cached()["summary"]
         self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
         self.assertEqual(s["unknown_prs"], 1)
+
+    def test_forgejo_prs_count_by_forge_and_never_collide_with_github_numbers(self):
+        from tauceti_worker import activity_forgejo
+
+        machine = "11e2756f00000000"
+        config = Path(self.tmp.name) / "workers.toml"
+        config.write_text('version = 1\n[[workers]]\nid = "w"\nforgejo = true\nnew_pr_forge = "forgejo"\n')
+
+        def iso(at):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+        bors = activity_forgejo.BORS_MERGED_PREFIX
+        issues = [
+            dict(number=5, state="open", title="feat: a", closed_at=None, pull_request=dict(merged=False)),
+            dict(
+                number=6,
+                state="closed",
+                title=bors + "feat: b",
+                closed_at=iso(self.now - 1800),
+                pull_request=dict(merged=False),
+            ),
+            dict(number=7, state="open", title="feat: c", closed_at=None, pull_request=dict(merged=False)),
+        ]
+        branches = {5: "roadmap/a-fleet-11e2756f-3", 6: "roadmap/b-fleet-11e2756f-4", 7: "roadmap/c-fleet-1752e85b-1"}
+        requests = []
+
+        def get(repo, path):
+            requests.append(path)
+            if path.startswith("/issues"):
+                return issues if "page=1" in path else []
+            number = int(path.rsplit("/", 1)[1])
+            # A landed PR's branch is gone; only its label keeps the name.
+            head = dict(label=branches[number], ref=f"refs/pull/{number}/head", sha="")
+            return dict(number=number, created_at=iso(self.now - 3600 * number), head=head)
+
+        with patch.dict(os.environ, {"TAUCETI_FLEET_MACHINE_ID": machine}):
+            fleet_events.mutation(  # GitHub PR #5 is a different PR from Forgejo #5.
+                {"argv": ["pr", "create"]}, SimpleNamespace(stdout="https://github.com/TauCetiProject/TauCeti/pull/5")
+            )
+            with patch.object(activity_forgejo, "_get", side_effect=get), patch.object(a, "observe", return_value=None):
+                a.prepare(config, now=self.now + 1)
+                self.assertEqual(sum(p.startswith("/pulls/") for p in requests), 3)
+                s = a.cached(group=machine)["summary"]
+                self.assertEqual(s["pr_windows"]["24h"]["authored"], 3)
+                self.assertEqual(s["pr_windows"]["24h"]["authored_forgejo"], 2)
+                self.assertEqual(s["pr_windows"]["24h"]["landed"], 1)
+                self.assertEqual(s["pr_windows"]["24h"]["landed_forgejo"], 1)
+                self.assertEqual(s["open_prs"], 1)  # Forgejo #5; GitHub #5 is not yet observed.
+                # The next pass lists only updates since this one and fetches no PR again.
+                requests.clear()
+                a.prepare(config, now=self.now + 1 + activity_forgejo.INTERVAL)
+                self.assertEqual([p for p in requests if p.startswith("/pulls/")], [])
+                self.assertIn("since=", requests[0])
 
     def test_missing_finishes_show_start_windows_latest_round_and_scope(self):
         # These were all discovered together. Recent counts must use their

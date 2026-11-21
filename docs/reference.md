@@ -22,6 +22,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
+| `--roadmap-targets FILE` | Author only from an operator [target list](target-lists.md): each roadmap round takes one open item whose prerequisites have landed, claims it, and assigns it to the agent; with nothing eligible the round authors nothing. `--roadmap-only` and `--roadmap-skip` narrow the areas it draws from. Re-read every round; an empty value means no list. |
 | `--extra-roadmap-prompt TEXT` | Operator guidance rendered into the roadmap prompt as its own section, steering the choice of target within the designated roadmap (and of area under `--roadmap-only ""`; an unpinned worker still draws its area at random first). It cannot override `--roadmap-skip`, others' claims, or the repository's rules; other phases ignore it. At most 4096 characters, not blank. |
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
@@ -30,6 +31,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex\|claude`; unreadable usage and provider hard limits still stop the round. Kiro and OpenRouter agents do not use the subscription pacer. |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
 | `--pace T:B[,T:B...]` | Pacing curve as `time%:budget%` points (e.g. `0:10,50:70,90:90`): usage must remain below the interpolated budget; time 0/100 default to 0/100. Default is `60:40`; `0:0,100:100` gives the plain `used% < elapsed%` rule. |
+| `--pace-claude T:B[,T:B...]`, `--pace-codex T:B[,T:B...]` | Pacing curve for that provider's session and weekly windows only, in the form `--pace` takes. A provider without one follows `--pace`, so an `auto` worker can spend two subscriptions on two curves. A provider's own curve, from its flag or its variable, applies whatever `--pace` says; an empty value returns the provider to `--pace`. |
 | `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its credential directories (`$HOME` on Linux; provider-specific Claude, Codex, and Kiro directories on macOS). |
 | `--isolate-home` | Force that per-worker isolation even for the `default` id (a distinct id already implies it). |
 | `--dry-run` | Survey and print the picker's decision; act on nothing. |
@@ -73,7 +75,12 @@ which no worker ever needs.
 If you run several workers on one host or in several containers, they get the
 same answer and coordinate with no configuration. Set `CLAIM_REPO` when you want
 to pin a namespace of your own anyway, for instance to keep two fleets under
-different `gh` accounts from contending with each other.
+different `gh` accounts from contending with each other. Free-choice roadmap
+agents on the GitHub host path receive that resolved namespace for their own
+`author/<area>/<slug>` claims; a failed namespace lookup falls back to the
+already selected authoring fork. With a target list, the worker takes its claim
+before launching the agent instead. Native sources retain their own claim
+wrapper and source identity.
 
 Claims are cooperative and fail-open. Honouring one only avoids duplicate work;
 the guarantee that two workers cannot clobber each other's branch is the
@@ -353,7 +360,11 @@ CODEX_HOME=~/.codex-tauceti tauceti work --agent codex --account you@example.com
 
 ## Environment variables
 
-Flags win over these. Most are tuning knobs with sane defaults.
+Each flag overrides its matching variable. A provider-specific pacing curve is
+more specific than the global curve even when inherited: `TAUCETI_PACE_CLAUDE`
+still applies beside `--pace`. Use `--pace-claude=` (or `pace_claude = ""` in
+workers.toml) to clear that override and return Claude to the global curve.
+Most variables are tuning knobs with sane defaults.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -365,13 +376,16 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
 | `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
+| `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | Path of the operator target list, for `--roadmap-targets`; blank means no list. |
 | `TAUCETI_EXTRA_ROADMAP_PROMPT` | _(unset)_ | Operator guidance for roadmap rounds, for `--extra-roadmap-prompt`. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
+| `TAUCETI_CLAUDE_USAGE_CREDENTIALS` | _(unset)_ | A second Claude login, as a config directory or a credentials file, that the pacer reads usage with. For workers whose agents run on a `claude setup-token` token; see [quota](quota.md#agents-on-a-setup-token-a-separate-usage-login). |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
+| `TAUCETI_PACE_CLAUDE`, `TAUCETI_PACE_CODEX` | _(unset)_ | Pacing curve for `--pace-claude` / `--pace-codex`; unset or empty = that provider follows `TAUCETI_PACE`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS` | unset | JSON mapping of absolute resolved installation paths to publisher provenance tokens. Only validated read-only installations use compact cached identities; writable inputs retain full validation. See [verification](verification.md). |
 | `TAUCETI_VERIFY_HELPER` | `0` | V0 dispatch remains the default. Set `1` only for an opt-in natural canary; helper CLI and receipts are available independently. Dispatch changes preserve running helpers and recovery jobs. |
@@ -381,7 +395,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
 | `TAUCETI_MATHLIB_POOL` | `$XDG_CACHE_HOME/mathlib`, else login user's `~/.cache/mathlib` | The pool those hardlinks go to and come from. |
 | `LAKE_CACHE_DIR` | `<worker state>/.cache/lake` | Lake's own build-output cache. Per-worker: unlike a toolchain install it is written throughout a build. |
-| `LAKE_CACHE_MAX_REVS` | `100` | Maximum revision history searched for published TauCeti artifacts; `0` searches all history. Host coding rounds warm both their selected branch and current main. |
+| `LAKE_CACHE_MAX_REVS` | `100` | Maximum revision history searched for published TauCeti artifacts; `0` searches all history. Host coding rounds warm both their selected branch and current main, and wait rather than start when the revision found has different dependencies (see [workers](workers.md), "Waiting for a matching TauCeti cache"). |
 | `LAKE_ARTIFACT_CACHE` | `1` | Keep local build outputs in Lake's artifact store so later rounds can reuse them. |
 | `LAKE_RESTORE_ARTIFACTS` | `1` | Copy artifact-store hits into the build directory for TauCeti's post-build audits. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
@@ -406,6 +420,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
 | `TAUCETI_ROUND_TIMEOUT` | `21600` | Hard safety cap per round (seconds), against a hung agent or tool: the loop kills the round's process group and abandons the round. Work, including verification, finishes inside the round; nothing is checkpointed or continued. |
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
+| `TAUCETI_ROUND_LOCK_WAIT` | `120` | How long a loop's round waits for its worker's `round.lock` (seconds), held briefly by another worker removing this worker's leftover worktree or by a round still finishing after a loop restart. A round that still finds it held exits as a claim collision, without failure backoff. |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
 | `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress prose attempts (seconds; eight hours by default). Mechanical documentation retries do not spend this window. |
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. A loop dedicated to `overlap-scan` requires only REST core. |
@@ -428,6 +443,11 @@ of subscription quota pacing. Supply `ANTHROPIC_API_KEY` or
 `--anthropic-api-key-file PATH`. Add `--budget` to consult the user-level grant
 ledger immediately before each paid Claude invocation. These settings are
 propagated through loop children, managed workers, reviewers, and Bubble.
+
+API billing rejects subscription pacing controls, including nonempty inherited
+`TAUCETI_PACE`, `TAUCETI_PACE_CLAUDE` and `TAUCETI_PACE_CODEX`. Clear them in the
+environment or with their matching blank flags (`--pace=`, `--pace-claude=`,
+`--pace-codex=`) before starting an API worker.
 
 `tauceti budget --grant USD` adds credit; `--set-grant USD` sets the current
 balance through an adjustment; `--grant-rate USD_PER_HOUR` changes automatic

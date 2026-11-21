@@ -6,6 +6,7 @@ the supplied token has write scopes or authorize bypassing native write checks.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -163,13 +164,32 @@ def advisory_scope(source, number):
     return ["source_advisory_v1", source.repository.key, source.identity.native_id, number]
 
 
-def advisory_policy(source):
-    """Separate trusted projections when the native publication policy changes."""
-    import hashlib
-    from pathlib import Path
+ADOPTED_AUTHORS_ENV = "TAUCETI_FORGEJO_ADOPTED_AUTHOR_IDS"
 
-    path = getattr(source, "review_publication_policy", None)
-    try:
-        return hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else ""
-    except OSError:
-        return None
+
+def adopted_author_ids() -> frozenset[int]:
+    """Forgejo user IDs whose open PRs this worker maintains as its own.
+
+    Set when the fleet's Forgejo account changes, so PRs the previous account
+    opened keep getting fixes, rebases and CI repair. Authoring pressure still
+    counts only the worker's own PRs.
+    """
+    raw = os.environ.get(ADOPTED_AUTHORS_ENV, "")
+    ids = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if not re.fullmatch(r"[1-9][0-9]*", item):
+            raise ValueError(f"{ADOPTED_AUTHORS_ENV} must be comma-separated positive Forgejo user IDs")
+        ids.add(int(item))
+    return frozenset(ids)
+
+
+def maintains_author(actor: SourceActor | None, forge: Forge, author_id) -> bool:
+    """Whether the authenticated actor maintains PRs by this user ID on `forge`."""
+    if actor is None or type(author_id) is not int or actor.principal.forge != forge:
+        return False
+    if author_id == int(actor.principal.native_id):
+        return True
+    return forge.kind == "forgejo" and author_id in adopted_author_ids()

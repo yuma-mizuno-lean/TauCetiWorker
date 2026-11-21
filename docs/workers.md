@@ -1,16 +1,29 @@
 # Persistent workers
 
-Worker data (`state/`, `checkouts/` and `logs/`) lives in one data root. An
-installed package (`uv tool install`, pip, a Fleet runtime) uses
+Worker data (`state/`, `checkouts/`, `logs/` and `host-repositories/`) lives in
+one data root. An installed package (`uv tool install`, pip) uses
 `$XDG_DATA_HOME/tauceti`, else `~/Library/Application Support/tauceti/data` on
 macOS, else `~/.local/share/tauceti`, so upgrading or reinstalling the code keeps
-it. A source checkout keeps it beside the code, gitignored. For the legacy
-TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects another absolute directory;
-round, verification and cleanup subprocesses inherit it, and bundled scripts and
-prompts remain with the code. Changing the location does not move data: the
-cleanup collector deletes data an earlier installation left in its package
-directory, and on Fleet hosts other runtimes' roots, once no worker or round
-holds their locks.
+it. A Fleet runtime uses `<fleet data>/worker-data/root` (normally
+`~/.local/share/tauceti-fleet/worker-data/root`), shared by every runtime
+revision; it keeps `~/.local/share/tauceti` only while that holds worker state
+and the fixed root does not. A source checkout keeps it beside the code,
+gitignored. For the legacy TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects
+another absolute directory; round, verification and cleanup subprocesses inherit
+it, and bundled scripts and prompts remain with the code. Changing the location
+does not move data: the cleanup collector deletes data an earlier installation
+left in its package directory, and on Fleet hosts other runtimes' roots, once no
+worker or round holds their locks.
+
+A data root inside a virtualenv looks disposable, so `tauceti doctor` fails and
+a worker loop refuses to start when it would create data there. Data already
+inside one only draws a warning; move it out by renaming each part into the new
+root and leaving a symbolic link at the old name. While workers run, swap the
+part with a link created beside it in one step (`mv --exchange`, coreutils 9.5),
+then rename the swapped-out directory into the new root: a separate rename and
+`ln -s` leave a moment where a worker can recreate an empty part at the old name. The collector treats a root
+whose parts are symbolic links into another as an alias: it collects the target
+once, through the selected root, and never stages or deletes it through the link.
 
 ## Fleet admission and reporting
 
@@ -22,6 +35,13 @@ clock-inconsistent policies prevent new rounds and paid Claude API admissions;
 an already-started agent session runs to completion. Workers report
 `waiting-capacity` while draining instead of being terminated. Workers without
 the environment variable behave as before.
+
+Each round also records, in the worker's runtime status, the authoring
+backpressure it enforces: `authoring` holds the open non-draft PRs it counts as
+its own on every healthy source (`sources`, `count`), the `limit`, whether roadmap
+authoring is `blocked`, the roadmap `scope` the count covers and its `skip`
+list, and `observed_at`. The count comes from that round's own survey, so it is
+current on any forge. A starting loop clears the previous report.
 
 `TAUCETI_FLEET_MACHINE_ID` and `TAUCETI_FLEET_EVENTS` opt into a private JSONL
 provenance journal. Successful PR creation and GitHub mutations record machine,
@@ -37,7 +57,8 @@ and `fractional_percent` for a fractional slot. Designated workers select an
 area before their survey from the intersection of that list and their eligible
 live areas, then run the normal maintenance, review, and authoring cascade within
 that area. The fractional slot takes that draw with the supplied integer
-percentage each round. Other workers retain the full random draw. Explicit `--roadmap-only` and
+percentage each round. Other workers retain the full random draw, and a worker with a
+[target list](target-lists.md) draws from its list instead. Explicit `--roadmap-only` and
 `--roadmap-skip` settings retain precedence; the usual maintenance and review
 priorities apply within the chosen area. Stale/malformed focus or no remaining
 eligible focus areas falls back to ordinary selection. Fleet controls this live through
@@ -277,6 +298,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `auto_refresh` | bool | `false` | Renew this worker's Claude access token when it expires, instead of parking until a human runs `claude`. Only safe when nothing else uses the same credential file — the refresh token is single-use. See [quota and pacing](quota.md) |
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
 | `roadmap_skip` | string list | `[]` | Roadmap areas to exclude. `roadmap_only` wins on overlap |
+| `roadmap_targets` | string | unset | Absolute path of an operator [target list](target-lists.md). Roadmap rounds author only its open items whose prerequisites have landed, one claimed item per round. Owned marked pull requests also take priority within each existing maintenance/review stage. Several workers may name the same file |
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |
 | `extra_roadmap_prompt` | string | unset | Operator guidance rendered into the roadmap prompt, steering target choice within the designated roadmap. Not blank, at most 4096 characters; other phases ignore it |
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |
@@ -284,10 +306,21 @@ other top-level key is an error, as is any unrecognized field inside a
 | `author_model` | string | unset | Exact authoring model. Requires an `agent` other than `auto` |
 | `author_effort` | string | unset | Authoring reasoning effort for Codex, Claude, or Kiro. Requires an explicit `agent` |
 | `pace` | string | unset | Pacing curve as `time%:budget%` points, for example `0:10,50:70,90:90`; rejected by `apply --check` if malformed |
+| `pace_claude`, `pace_codex` | string | unset | Pacing curve for that provider's windows only, in the form `pace` takes and checked the same way. A provider without one follows `pace`; meant for an `auto` worker whose two subscriptions should be spent at different rates |
 | `stream` | bool | `false` | Keep the agent transcript in the console log instead of a separate file |
 | `isolate_home` | bool | `false` | Force credential isolation for the id `default`; every other id already enables it |
 | `restart` | string | `"always"` | `always` after any exit, `on-failure` after a nonzero exit, or `never`; explicit restart and re-enable still work |
 | `env` | table of strings | `{}` | Extra environment for this worker's process tree, for settings with no flag of their own. Values must be quoted strings, names POSIX-portable, and the table at most 16 KB. The variables the worker sets itself (`TAUCETI_MANAGED`, `TAUCETI_LOG_FILE`, `TAUCETI_PARENT_PIPE_FD`, `TAUCETI_DATA_HOME`, and the runtime-status path) are rejected. **Not a secret store** — see below |
+
+Each pacing field overrides only its matching environment variable. An inherited
+`TAUCETI_PACE_CLAUDE` still takes precedence over `pace`; use `pace_claude = ""`
+to clear that override and follow the global curve. The same rule applies to
+Codex. `workers status` shows the running worker's captured effective curves;
+stopped workers and pending definitions show configured curves before inheritance.
+API-billed workers reject subscription pacing from the `env` table and pacing
+fields during configuration validation. Inherited settings are rejected in the
+child before credentials are created, so the viewing shell's environment cannot
+invalidate other workers' configuration.
 
 The manager fingerprints each definition. It stops a worker when `enabled`
 becomes false and restarts an enabled worker when any other field changes,
@@ -406,6 +439,59 @@ Archive seeding skips duplicates, and an archive removed concurrently by pool co
 is an individual cache miss for Lake to fetch. Native fetch arguments and Mathlib snapshot
 keys/inventory checks are unchanged.
 
+A worker's build tree outlives its rounds, so it can hold modules an earlier round compiled
+locally. When CI has published outputs for the same input hash and they differ from the
+local ones, Lake would still trust the local trace. Locally built bytes need not match CI's,
+and every module downstream would then miss the cache and compile locally. After hydration,
+preparation therefore removes each such module's trace (and its `.hash` sidecars), and Lake
+restores CI's outputs by hard link. Modules CI has not published are the agent's own work and
+are left alone. The receipt counts `ci_disagreeing_traces`, `ci_disagreeing_removed` and
+`ci_disagreeing_skipped` (deferred because a file was busy).
+
+#### Waiting for a matching TauCeti cache
+
+`lake cache get --max-revs=N` installs the newest published revision in the last N commits.
+When CI has not yet published a commit that changed dependencies (a Mathlib bump, say), that
+revision predates the change, none of its outputs apply, and the round would compile all of
+TauCeti, which cannot finish within the round limit. Host agent rounds (roadmap, overlap-fix,
+and the PR rounds fix, fix-ci, rebase, bump and lint-repair) therefore check the cache before
+the agent starts. The revision Lake installed is the first commit in `git rev-list HEAD -n N`
+whose revision map is in the round's download directory, which is the same rule Lake follows
+(maps seeded from the pool included). Its `lake-manifest.json` package revisions and
+`lean-toolchain` are compared with the checkout's dependency files as prepared. A rebase round
+prepares with main's files, so main's cache is the one it needs. For a PR round, the main
+revision fetched alongside also counts. If either matches, the round proceeds. A fallback with
+the same dependencies is logged as a same-dependency fallback and only the commits in between
+rebuild.
+
+Otherwise the round ends as `waiting-build-cache` (exit 79): no failure, no attempt charged,
+downloaded and hydrated outputs kept, and the worker selects other work after 5 seconds.
+`tauceti workers status` shows the state, the commit and the recheck time. The round writes
+`<pool>/cache-waits/<commit>-<dependencies>.json`, keyed by the head and the dependency files it
+prepared, with a retry time five minutes ahead. It records the stage and the revision whose map
+would serve those dependencies: the head for its own, main for main's (a rebase round). Until the
+retry time, other workers on the host skip the same stage on that head, and skip roadmap and
+overlap-fix while a wait on main is recorded (roadmap reports `waiting-build-cache` itself, since
+it is the last candidate). A fix of a head whose rebase is waiting is not held. At most every
+30 seconds per host, a selecting worker sends an anonymous `HEAD` request for that revision's
+map, `<TAUCETI_CACHE_REVISION_URL>/TauCetiProject/TauCeti/tc/<toolchain>/<revision>.jsonl`, with
+the prepared toolchain mangled as Lake does (`leanprover--lean4---v4.36.0`); a 200 removes the
+wait. When the retry time passes, the next round to select that work claims the check for two
+minutes, together with its own later candidates, and goes through. Only cache preparation
+re-arms the retry time, so a round that claims and then declines lets the claim lapse for the
+next one. A successful check on main clears every wait on main. Any error reading or writing
+markers, or probing, lets work proceed, including the round that could not record its wait. A marker
+that exists but cannot be read is left alone rather than restarted. At most once an hour per
+host, selection deletes every marker whose first wait is more than seven days old, whatever its
+head or stage; released PR waits are kept until then, so a spent grace is not granted again.
+
+A wait older than an hour logs one warning per host and commit, naming the URL CI should have
+published. Rounds on main wait without limit: main always gets a cache, and building anyway
+only occupies the host. A PR whose own head changes dependencies relative to main only gets a
+cache once CI builds that PR, which may never succeed, so after two hours of waiting its rounds
+proceed on the fallback cache as before, letting the repair agent work on the PR. Bubble rounds,
+bump attestation and the queue's repair service do not wait.
+
 The existing pool status receipt also records mapping/seed/install counts and per-phase
 elapsed and CPU seconds for seeding, fetching, transfer, expansion/hydration, and Mathlib
 view preparation. CPU includes the preparator and reaped children. Phases can be nested,
@@ -523,11 +609,13 @@ entry with `enabled = true`.
 | `--auto-refresh` | `auto_refresh` |
 | `--roadmap-only AREA` | `roadmap_only` |
 | `--roadmap-skip AREAS` | `roadmap_skip`, as a comma-separated list |
+| `--roadmap-targets FILE` | `roadmap_targets`, made absolute |
 | `--extra-roadmap-prompt TEXT` | `extra_roadmap_prompt` |
 | `--source PATH_OR_URL` | `source`; also requires `roadmap` in `--only` and a non-empty `--roadmap-only` |
 | `--author-model MODEL` | `author_model` |
 | `--author-effort EFFORT` | `author_effort`; Codex, Claude, or Kiro only |
 | `--pace CURVE` | `pace` |
+| `--pace-claude CURVE`, `--pace-codex CURVE` | `pace_claude`, `pace_codex` |
 | `--stream` | `stream` |
 | `--isolate-home` | `isolate_home`; useful when the id is `default` |
 
@@ -633,6 +721,26 @@ action that names a different `--config` file reports the conflict instead of
 switching it.
 
 That is a systemd user service on Linux and NixOS, or a LaunchAgent on macOS.
+On Linux the service runs in `tauceti-workers.slice` and each worker moves itself
+into its own transient scope there, as Fleet workers do. Restarting the service (to
+adopt a new Worker runtime, for example) then adopts the running workers instead of
+stopping their rounds. A service installed before this change keeps its workers in the
+service itself: rerun `tauceti workers service install` and restart the service once,
+at a quiet moment, to move to scopes.
+
+The installer also writes `tauceti-workers.slice`. Limits set there cover the manager
+and every worker scope together, so set them on the slice rather than with
+`systemctl set-property` on the service, which worker scopes escape:
+
+```bash
+tauceti workers service install --cpu-quota 3200% --memory-high 48G
+```
+
+`--cpu-quota`, `--memory-high` and `--memory-max` take systemd's `CPUQuota=`,
+`MemoryHigh=` and `MemoryMax=` values. A later install without an option keeps the
+installed value, and an empty value (`--memory-high ''`) removes it. The install
+reloads systemd, which applies new limits to running workers without a restart.
+
 Two platform caveats:
 
 - On Linux systems that stop the user manager after the last logout,

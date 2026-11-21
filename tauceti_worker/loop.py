@@ -14,7 +14,7 @@ import time
 from .agents import resolve_authoring_profile
 from .budget import ACCOUNTING_ERRORS, Budget, BudgetError, admission_pause
 from .claude_api import api_mode
-from .config import Config, NoProgress, log
+from .config import Config, NoProgress, log, one_line
 from .constants import (
     BACKOFF_BASE,
     BACKOFF_MAX,
@@ -32,7 +32,7 @@ from .constants import (
 from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
 from .github_state import enabled as github_state_enabled
-from .quota import Provider, Quota, _hours, _unavail_reason, quota_line
+from .quota import Provider, Quota, _hours, _unavail_reason, claude_usage_credentials, quota_line
 from .quota_wait import QuotaWait
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
@@ -83,7 +83,16 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'}{targeted} "
         f"agent={agent}{' [bubble]' if bubble else ''}"
     )
-    report_runtime("idle", detail="loop started", phase=None, target=None, roadmap_focus=None, next_action_at=None)
+    report_runtime(
+        "idle",
+        detail="loop started",
+        phase=None,
+        target=None,
+        roadmap_focus=None,
+        roadmap_target=None,
+        next_action_at=None,
+        authoring=None,  # a new loop's sources or limits may differ; its first round reports afresh
+    )
     streak = 0
     admission_streak = 0
     collision_streak = 0
@@ -143,6 +152,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 phase=None,
                 target=None,
                 roadmap_focus=None,
+                roadmap_target=None,
                 failure_reason=None,
                 failure_code=None,
                 failure_log=None,
@@ -383,6 +393,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     phase=None,
                     target=None,
                     roadmap_focus=None,
+                    roadmap_target=None,
                     next_action_at=time.time() + INTERROUND,
                 )
                 time.sleep(INTERROUND)
@@ -397,7 +408,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     if published
                     else ("round timed out" if rc in (124, 137) else f"round exited with status {rc}")
                 )
-                log(f"round {tag}; no-progress streak={streak} — backing off {nap}s")
+                why = f": {one_line(str(published))}" if published else ""
+                if failed.get("failure_log"):
+                    why += f" (log: {failed['failure_log']})"
+                log(f"round {tag}{why}; no-progress streak={streak} — backing off {nap}s")
                 report_runtime(
                     "backoff",
                     detail=reason,
@@ -498,6 +512,12 @@ def _credential_hint(agent: str, prov: Provider | None) -> str:
         return ""
     if agent != "claude":
         return ". Run `codex login` to renew the credential"
+    usage = claude_usage_credentials()
+    if usage is not None:
+        return (
+            f". Sign in again to the usage login at {usage}, or --auto-refresh to let an unattended worker"
+            " rotate it (see docs/quota.md)"
+        )
     if sys.platform == "darwin":
         # The Keychain is the store here and the worker never writes it, so --auto-refresh does nothing
         # and offering it would send the operator after a flag that cannot help.

@@ -16,7 +16,8 @@ such as `roadmap`, `review`, `fix`, or `security-audit`; fallback candidates are
 not additional rounds. All supported round types appear even when their counts
 are zero; the prepared summary publishes the worker taxonomy for other consumers.
 No-work surveys have their own row. Admission/GitHub
-waiting attempts and dry runs are excluded. Failed/interrupted rounds are
+waiting attempts, rounds waiting for a matching TauCeti build cache (`waiting-build-cache`,
+recorded with dependency `build-cache` and the commit) and dry runs are excluded. Failed/interrupted rounds are
 included, with a failure subset (including timeouts). Running rounds and
 processes interrupted without a finish receipt are separate. The current
 "workers working" count is distinct workers with an active work round, excluding
@@ -40,6 +41,19 @@ the shared server supplies the recorded promotion to main, bound to the exact
 approved PR head and constructed batch commit. Titles, reviews, CI success and
 staging pushes are not landing evidence. Ordinary closed PRs do not produce a
 missing-landing warning.
+
+Forgejo PRs count too, and the report shows them beneath the totals (`on Forgejo`,
+`from Forgejo`). Forgejo publishes no creation receipt, so when a worker in the
+configuration has Forgejo enabled, the collector reads that Forgejo repository's PR
+list. A PR belongs to this host when its branch ends in one of this host's worker
+IDs (`roadmap/<slug>-fleet-<machine8>-<n>`). The first pass reads every PR, which
+backfills earlier Forgejo work; later passes, at most every five minutes, read only
+PRs updated since the previous complete pass. A Forgejo PR lands when it merges or
+when the queue closes it under the `[Merged by Bors] - ` title. Forgejo PRs and
+their contributions are keyed by the forge-qualified repository
+(`forgejo:https://git.taucetiproject.org/taucetiproject/tauceti`), so their numbers
+never mix with GitHub's. Their landed LOC is not measured yet; it counts as
+missing and the LOC rates estimate it.
 
 ## Costs and landed PR output
 

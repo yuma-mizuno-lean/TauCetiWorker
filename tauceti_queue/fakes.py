@@ -381,7 +381,7 @@ class FakeGitHub:
                     post("build", "failure", "infrastructure: runner lost its cache volume", "")
                 elif run.verdict == "scope-fail":
                     # A green build whose merge-policy verdict is red (restricted paths without a current
-                    # admin approval, an oversized diff, a new file over 1000 lines).
+                    # admin approval, an oversized diff, a new file over 1250 lines).
                     run.conclusion = "success"
                     post("build", "success", "Build succeeded")
                     policy["scope"] = ("failure", "restricted paths changed with no valid current bors scope approval")
@@ -394,6 +394,10 @@ class FakeGitHub:
                     run.conclusion = "success"
                     post("build", "success", "Build succeeded")
                     policy = {}
+                elif run.verdict == "incomplete":
+                    # The `sandboxed-build` runner died before its report step: the finalizer posts this.
+                    run.conclusion = "failure"
+                    post("build", "failure", "sandboxed merge-group build did not complete")
                 elif run.verdict == "cancel":
                     run.conclusion = "cancelled"
                 elif run.verdict == "no-status":
@@ -712,6 +716,10 @@ class FakeGitHub:
             },
         }
 
+    def admission_insertion_source(self, repo, number, head):
+        self._call("admission_insertion_source", number)
+        return self._admission_source(number)
+
     def admission_snapshot(self, repo, number, *, generation=0):
         self._call("admission_snapshot", number)
         pull = self.fetch_pr(repo, number)
@@ -733,9 +741,33 @@ class FakeGitHub:
         local = accepted(
             pull.labels, member=pull.author_login in getattr(self, "self_tested_members", set())
         ) and allowed_paths(paths)
-        return AdmissionSnapshot(
-            pull, base, paths, tuple(source["comments"]), source["statuses"], base, self_tested=local
+        from . import diff_guard
+
+        exempt = pull.head_sha in getattr(self, "large_refactor_heads", set())
+        guard = (
+            diff_guard.violations(self.repo.clone, base, pull.head_sha, large_refactor=exempt)
+            if local or exempt
+            else ()
         )
+        return AdmissionSnapshot(
+            pull,
+            base,
+            paths,
+            tuple(source["comments"]),
+            source["statuses"],
+            base,
+            self_tested=local,
+            diff_guard=guard,
+            large_refactor=exempt,
+        )
+
+    def bump_guard(self, repo, head):
+        """`bump_verdicts[head]`: True or False is the verdict, None an unreadable input."""
+        self._call("bump_guard", head)
+        verdict = getattr(self, "bump_verdicts", {}).get(head, False)
+        if verdict is None:
+            raise GitHubUnavailable("fake bump-guard inputs unavailable")
+        return verdict
 
     def list_open_pull_requests(
         self, repo: str, *, review_app_id: int, admission=False, on_page=None

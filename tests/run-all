@@ -54,6 +54,8 @@ trap 'rm -rf "$RUN_ROOT"' EXIT
 # stdlib-only python tests, run with the project interpreter
 RUN_STDLIB=(
   build_resources.py
+  excerpt.py
+  build_cache_wait.py
   activity.py
   activity_git.py
   activity_costs.py
@@ -70,6 +72,7 @@ RUN_STDLIB=(
   queue_repair_task.py
   queue_repair_locks.py
   queue_repair_cleanup.py
+  queue_install_releases.py
   queue_repair_cache.py
   queue_claude_stdin.py
   expanded_cache.py
@@ -91,12 +94,15 @@ RUN_STDLIB=(
   authoring_profiles.py
   openmathos.py
   bubble_cache.py
+  bubble_mounts.py
+  cache_probe_user_agent.py
   bubble_version.py
   branch_claim_repo.py
   build_status_rollup.py
   bump_integration.py
   claude_config_dir.py
   claude_keychain.py
+  claude_usage_isolation.py
   claims_repo.py
   codex_account.py
   codex_fallback.py
@@ -108,6 +114,8 @@ RUN_STDLIB=(
   fork_authoring.py
   fleet_capacity.py
   forge_inventory.py
+  forgejo_mirror.py
+  forgejo_restore.py
   forge_contracts.py
   forgejo_reads.py
   github_accounts.py
@@ -144,10 +152,12 @@ RUN_STDLIB=(
   mirror_creds.py
   mirror_creds_macos.py
   oauth_refresh_loop.py
+  oauth_user_agent.py
   observability_failures.py
   open_pr_pages.py
   overlaps.py
   pace_curve.py
+  pace_per_provider.py
   pr_targeting.py
   preflight_review_lake.py
   prices.py
@@ -158,6 +168,7 @@ RUN_STDLIB=(
   prompt_wrapper_paths.py
   provider_usage.py
   quota_auto_refresh.py
+  quota_usage_credentials.py
   quota_cache_fp.py
   quota_loop_refresh.py
   quota_wakeups.py
@@ -177,6 +188,7 @@ RUN_STDLIB=(
   queue_execution.py
   queue_ci_requests.py
   queue_forgejo_git.py
+  queue_forgejo_team_sync.py
   queue_forgejo_source.py
   queue_ci_execution.py
   queue_workflow_token.py
@@ -204,6 +216,8 @@ RUN_STDLIB=(
   queue_statistics.py
   queue_admission_state.py
   queue_admission.py
+  queue_admission_evidence.py
+  queue_insertion_check.py
   queue_admission_adapter.py
   queue_config.py
   queue_cli.py
@@ -226,7 +240,6 @@ RUN_STDLIB=(
   review_provider_down.py
   review_outcomes.py
   review_runtime.py
-  native_review_publisher.py
   review_unchanged_memo.py
   synchronous_state_repair.py
   source_mergeability.py
@@ -235,6 +248,8 @@ RUN_STDLIB=(
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py
+  roadmap_claim_namespace.py
+  round_crash_reasons.py
   round_file_changes.py
   round_group_sweep.py
   resources.py
@@ -244,6 +259,10 @@ RUN_STDLIB=(
   scoreboard_trust.py
   security_audit.py
   security_audit_served.py
+  security_audit_pool.py
+  security_audit_claude.py
+  security_audit_watchdog.py
+  security_audit_evidence.py
   shared_build_caches.py
   shared_repositories.py
   source_argument.py
@@ -255,6 +274,9 @@ RUN_STDLIB=(
   ssl_cert_file.py
   staging_journal_report.py
   status_labels.py
+  target_list.py
+  target_landings.py
+  target_maintenance.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
@@ -280,7 +302,12 @@ NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py retention.py
 # Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.
-DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py)
+DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py target_list.py)
+# Modules whose code under test scans every process of the user (/proc, pgrep) and fails closed
+# or holds back when another process is busy or uninspectable. Concurrent modules (their sandboxed
+# children, a detached `git gc`) can disturb that scan, so with -j above 1 these run one at a
+# time after the parallel batch.
+HOST_PROCESSES=(legacy_data_root.py queue_install_releases.py)
 
 pass=0; fail=0; failed=()
 
@@ -305,8 +332,8 @@ if ((${#unclassified[@]})); then
   printf '  - %s\n' "${unclassified[@]}" >&2
   exit 2
 fi
-for t in "${NATIVE_FS[@]}" "${DOCS_CONTRACT[@]}"; do
-  [[ "${known[*]}" == *" $t "* ]] || { echo "ERROR: $t is in NATIVE_FS/DOCS_CONTRACT but not a known test" >&2; exit 2; }
+for t in "${NATIVE_FS[@]}" "${DOCS_CONTRACT[@]}" "${HOST_PROCESSES[@]}"; do
+  [[ "${known[*]}" == *" $t "* ]] || { echo "ERROR: $t is in NATIVE_FS/DOCS_CONTRACT/HOST_PROCESSES but not a known test" >&2; exit 2; }
 done
 # A test that asserts on the repository's documentation must be in DOCS_CONTRACT, or a docs-only
 # change could break it without CI running it.
@@ -381,7 +408,12 @@ export RUN_ROOT FAIL_FAST
 
 # --- run ------------------------------------------------------------------------------------------
 echo "run-all: ${#selected[@]} modules, group $GROUP, $JOBS at a time, python $PY"
-printf '%s\n' "${selected[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
+parallel=(); alone=()
+for t in "${selected[@]}"; do
+  if [ "$JOBS" -gt 1 ] && in_list "$t" "${HOST_PROCESSES[@]}"; then alone+=("$t"); else parallel+=("$t"); fi
+done
+((${#parallel[@]})) && printf '%s\n' "${parallel[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
+for t in "${alone[@]}"; do bash -c 'run_one "$1"' _ "$t"; done
 
 for t in "${selected[@]}"; do
   d="$RUN_ROOT/${t%.*}"

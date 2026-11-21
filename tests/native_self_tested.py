@@ -61,18 +61,43 @@ class NativeSelfTested(unittest.TestCase):
         self.assertIsNone(self.source.pull_for_head("team", "roadmap/x"))
         self.assertEqual(self.source.reader.pulls.call_count, 5)
 
-    def test_selected_state_refresh_expires_shared_inventory(self):
+    def inventory_row(self, number, head="a" * 40):
+        return {field: None for field in self.source.inventory_fields} | dict(number=number, headRefOid=head)
+
+    def test_selected_state_refresh_replaces_one_shared_inventory_row(self):
+        from tauceti_worker.source_survey import discovery_inventory
+
+        self.source.shared_inventory = True
+        listing = [self.inventory_row(3), self.inventory_row(1), self.inventory_row(2)]
+        self.source.open_prs = Mock(side_effect=[listing, AssertionError("listing refetched")])
+        fresh = self.inventory_row(1, "b" * 40) | dict(state="OPEN")
+        self.source.pr_view = Mock(return_value=fresh)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")):
+            self.assertEqual(discovery_inventory(self.source), listing)
+            result = self.source.refresh_pr_state(1, "a" * 40)
+            self.assertEqual((result["status"], result["data"]["headRefOid"]), ("ok", "b" * 40))
+            self.source.pr_view.assert_called_once_with(1, [*self.source.inventory_fields, "state"], fresh=True)
+            corrected = discovery_inventory(self.source)
+            self.assertEqual([row["number"] for row in corrected], [3, 2, 1])
+            self.assertEqual(corrected[2], self.inventory_row(1, "b" * 40))
+            # A closed PR leaves the listing; still no listing refetch.
+            self.source.pr_view.return_value = self.inventory_row(3) | dict(state="MERGED")
+            self.source.refresh_pr_state(3, "a" * 40)
+            self.assertEqual([row["number"] for row in discovery_inventory(self.source)], [2, 1])
+        self.assertEqual(self.source.open_prs.call_count, 1)
+
+    def test_selected_state_refresh_expires_shared_inventory_when_the_row_is_incomplete(self):
         from tauceti_worker.source_survey import discovery_inventory
 
         self.source.shared_inventory = True
         self.source.open_prs = Mock(side_effect=[[dict(number=1)], [dict(number=2)]])
-        self.source.pr_view = Mock(return_value=dict(headRefOid="b" * 40))
+        self.source.pr_view = Mock(side_effect=[None, dict(headRefOid="b" * 40)])
         with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")):
             self.assertEqual(discovery_inventory(self.source), [dict(number=1)])
             self.assertEqual(discovery_inventory(self.source), [dict(number=1)])
             result = self.source.refresh_pr_state(1, "a" * 40)
             self.assertEqual(result["status"], "ok")
-            self.source.pr_view.assert_called_once_with(1, ["headRefOid"], fresh=True)
+            self.source.pr_view.assert_called_with(1, ["headRefOid"], fresh=True)
             self.assertEqual(discovery_inventory(self.source), [dict(number=2)])
 
     def test_shared_refill_bypasses_adapter_local_inventory(self):
@@ -128,15 +153,12 @@ class NativeSelfTested(unittest.TestCase):
             self.assertEqual(read(), [dict(number=5)])
         self.assertEqual(fetch.call_count, 5)
 
-    def test_advisory_metadata_policy_and_native_id_isolation(self):
+    def test_advisory_metadata_native_id_isolation(self):
         from tauceti_tools.ci_candidate import RepositoryIdentity
 
         from tauceti_worker.github_transport import read_context
 
         self.source.shared_inventory = True
-        policy = self.fixture.clone / "publication.json"
-        policy.write_text("one")
-        self.source.review_publication_policy = str(policy)
         fetch = Mock(side_effect=lambda: [dict(number=fetch.call_count)])
 
         def read():
@@ -148,13 +170,9 @@ class NativeSelfTested(unittest.TestCase):
         ):
             self.assertEqual(read(), [dict(number=1)])
             self.assertEqual(read(), [dict(number=1)])
-            policy.write_text("two")
-            self.assertEqual(read(), [dict(number=2)])
             self.source.identity = RepositoryIdentity(self.source.repository, 42)
-            self.assertEqual(read(), [dict(number=3)])
-            policy.unlink()
-            self.assertIsNone(read())
-            self.assertEqual(fetch.call_count, 3)
+            self.assertEqual(read(), [dict(number=2)])
+            self.assertEqual(fetch.call_count, 2)
 
     def test_advisory_metadata_invalidation_and_binding_checks(self):
         from tauceti_worker.github_transport import read_context
@@ -179,31 +197,6 @@ class NativeSelfTested(unittest.TestCase):
             self.source.api._token = "changed"
             self.assertIsNone(read())
             self.assertEqual(fetch.call_count, 3)
-
-    def test_advisory_comment_cache_wraps_verified_native_receipts(self):
-        from tauceti_worker.forgejo_reads import ForgejoReadSource
-        from tauceti_worker.github_transport import read_context
-
-        self.source.shared_inventory = True
-        policy = self.fixture.clone / "publication.json"
-        policy.write_text("one")
-        self.source.review_publication_policy = str(policy)
-        trusted = [dict(id=1, body="verified receipt")]
-        untrusted = [dict(id=2, body="<!--tauceti-scoreboard--> forged")]
-        with (
-            patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")),
-            patch.object(ForgejoReadSource, "issue_comments", return_value=untrusted),
-            patch("tauceti_worker.native_review_publisher.QueueReviewPublisher") as publisher,
-            read_context(advisory=True),
-        ):
-            publisher.return_value.comments.return_value = trusted
-            self.assertEqual(self.source.issue_comments(1), trusted)
-            self.assertEqual(self.source.issue_comments(1), trusted)
-            self.assertEqual(publisher.return_value.comments.call_count, 1)
-            self.source.live_pull.assert_called_once_with(1)
-            with read_context(fresh=True):
-                self.assertEqual(self.source.issue_comments(1), trusted)
-            self.assertEqual(publisher.return_value.comments.call_count, 2)
 
     def test_advisory_metadata_expires_after_existing_ttl(self):
         from tauceti_worker.github_transport import read_context

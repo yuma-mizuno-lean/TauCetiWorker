@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -467,6 +469,22 @@ class Canonical(unittest.TestCase):
         sweep(set())
         self.assertFalse((objects / name).exists())
 
+    def test_sweep_stops_at_its_deadline(self):
+        from tauceti_worker import retention
+
+        checkout = self.checkout("w", "TauCeti.A")
+        self.relink(checkout)
+        objects = canonical.store(self.pool) / "objects"
+        name = paths(checkout)[0][1]
+        shutil.rmtree(checkout)
+        for lease in (canonical.store(self.pool) / "uses").glob("*"):
+            lease.unlink()
+        report = retention.fresh_report(time.time())
+        freed = canonical.sweep(self.pool, report, lifetime=1, remove=retention.remove, deadline=time.monotonic() - 1)
+        self.assertEqual(freed, 0)
+        self.assertEqual(report["deferred"], ["canonical-objects"])
+        self.assertTrue((objects / name).exists())
+
     def test_hashing_that_outlasts_the_grace_still_makes_progress(self):
         modules = [f"TauCeti.M{i}" for i in range(8)]
         checkout = self.checkout("w", *modules)
@@ -516,6 +534,59 @@ class Canonical(unittest.TestCase):
         cache.hydrate(entry, private, "d" * 16)
         self.assertTrue((private / "outputs/TauCeti" / ("d" * 16 + ".json")).exists())
 
+    def expander(self, checkout):
+        """`(expand, archive)`: `expand()` runs one CI expansion of an archive of `checkout`'s build."""
+        payload = b"archive of " + checkout.name.encode()
+        archive = lake_hash(payload) + ".ltar"
+        download = self.root / "download"
+        (download / "artifacts").mkdir(parents=True)
+        (download / "artifacts" / archive).write_bytes(payload)
+        cache.atomic_json(download / "outputs/TauCeti" / ("d" * 16 + ".json"), dict(data=archive))
+        build = checkout / ".lake/build"
+
+        def run(args, *, input, **kwargs):  # leantar: fresh inodes of the archived outputs
+            for job in json.loads(input):
+                shutil.copytree(build / "lib/lean", job["base"][0], dirs_exist_ok=True)
+                shutil.copytree(build / "ir", job["base"][1], dirs_exist_ok=True)
+
+        tools = SimpleNamespace(check_output=lambda *a, **k: str(self.root / "toolchain"), run=run)
+
+        def expand():
+            report = dict(hits=0, expanded=0)
+            with patch.object(cache, "subprocess", tools):
+                cache.expand(download, self.root / "private", self.root, {}, self.pool, report)
+            return report["hits"], report["expanded"]
+
+        return expand, archive
+
+    def test_restored_outputs_beside_a_stale_trace_are_removed_not_rejected(self):
+        # CI's and a local build of one Lake input differ only in `.olean.private`.
+        builds = {}
+        for seed in ("ci", "w"):
+            checkout = self.checkout(seed, "TauCeti.A", seed="same")
+            lib = checkout / ".lake/build/lib/lean/TauCeti"
+            data = seed.encode() * 64
+            (lib / "A.olean.private").write_bytes(data)
+            trace = json.loads((lib / "A.trace").read_text())
+            trace["outputs"]["o"].append(lake_hash(data) + ".olean.private")
+            (lib / "A.trace").write_text(json.dumps(trace))
+            builds[seed] = checkout
+        checkout = builds["w"]
+        self.relink(checkout)  # The local build was published first.
+        expand, _ = self.expander(builds["ci"])
+        self.assertEqual(expand(), (0, 1))
+        # Lake restores CI's outputs from the hydrated store but keeps the stale local trace.
+        private = self.root / "private"
+        for (path, _), (_, theirs) in zip(paths(checkout), paths(builds["ci"]), strict=True):
+            path.unlink()
+            os.link(private / "artifacts" / theirs, path)
+        report = canonical.relink(checkout, private, self.pool)  # the round-end relink
+        self.assertEqual(report["invalidated_outputs"], 1)
+        self.assertFalse((checkout / ".lake/build/lib/lean/TauCeti/A.olean.private").exists())  # Lake rebuilds A.
+        self.assertEqual(canonical.rejected(self.pool), set())
+        self.assertEqual(expand(), (1, 0))  # The next round hydrates CI's entry.
+        self.assertEqual(canonical.rejected(self.pool), set())
+
     def test_rejected_bytes_are_never_rehydrated_or_kept_privately(self):
         checkout = self.checkout("w", "TauCeti.A")
         self.relink(checkout)
@@ -538,6 +609,61 @@ class Canonical(unittest.TestCase):
         report = canonical.relink(checkout, private, self.pool, sweep_private=True)
         self.assertEqual(report["stale_store_files"], 1)
         self.assertFalse((private / "artifacts" / name).exists())
+
+    def rejected_pool_alias(self):
+        """A pool whose `artifacts/` alias, canonical object and entry share one rejected inode.
+
+        The bytes are even correct, so only the rejection keeps them from being adopted. Returns
+        `(expand, name, bad)`, where `expand()` runs one CI expansion of the module's archive.
+        """
+        checkout = self.checkout("w", "TauCeti.A")
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
+        expand, archive = self.expander(checkout)
+        shared = self.pool / "artifacts" / name
+        shared.parent.mkdir(parents=True)
+        shutil.copyfile(olean, shared)
+        directory = canonical.store(self.pool)
+        (directory / "objects").mkdir(parents=True, exist_ok=True)
+        os.link(shared, directory / "objects" / name)
+        canonical.record(directory, name, *canonical.digest(shared), "test")
+        bad = shared.lstat()
+        canonical.reject(self.pool, bad)
+        entry = self.pool / "entries" / archive[:-5]
+        entry.mkdir(parents=True)
+        outputs = json.loads((checkout / ".lake/build/lib/lean/TauCeti/A.trace").read_text())["outputs"]
+        for path, descriptor in paths(checkout):
+            if descriptor == name:
+                os.link(shared, entry / descriptor)
+            else:
+                shutil.copyfile(path, entry / descriptor)
+        os.link(self.root / "download/artifacts" / archive, entry / archive)
+        cache.atomic_json(entry / "entry.json", dict(data=dict(outputs, l=archive)))
+        return expand, name, bad
+
+    def assert_fresh_publication(self, name, bad):
+        entry = next((self.pool / "entries").iterdir()) / name
+        fresh = entry.lstat()
+        self.assertNotEqual(fresh.st_ino, bad.st_ino)
+        self.assertEqual(stat.S_IMODE(fresh.st_mode), 0o444)
+        self.assertEqual((self.root / "private/artifacts" / name).lstat().st_ino, fresh.st_ino)
+        # The rejected pool names linger, but no entry or store adopts them.
+        self.assertEqual((self.pool / "artifacts" / name).lstat().st_ino, bad.st_ino)
+        self.assertEqual((canonical.store(self.pool) / "objects" / name).lstat().st_ino, bad.st_ino)
+
+    def test_reexpansion_never_adopts_a_rejected_shared_alias_or_canonical_object(self):
+        expand, name, bad = self.rejected_pool_alias()
+        self.assertEqual(expand(), (0, 1))
+        self.assertEqual(expand(), (1, 0))  # The next round simply hydrates.
+        self.assert_fresh_publication(name, bad)
+
+    def test_reexpansion_publishes_read_only_bytes_beside_a_busy_rejected_alias(self):
+        expand, name, bad = self.rejected_pool_alias()
+        shared = self.pool / "artifacts" / name
+        os.chmod(shared, 0o644)
+        with open(shared, "r+b"):  # Busy as well as rejected.
+            self.assertEqual(expand(), (0, 1))
+            self.assertEqual(expand(), (1, 0))
+        self.assert_fresh_publication(name, bad)
 
     def test_private_alias_is_dropped_only_while_it_is_the_rejected_snapshot(self):
         checkout = self.checkout("w", "TauCeti.A")
@@ -661,6 +787,108 @@ class Canonical(unittest.TestCase):
         self.assertFalse((objects / found[1][1]).exists())
         self.assertTrue(held.exists() and later.exists())
         self.assertEqual(report["published_local"], len(found) - 2)
+
+    def test_a_reused_descriptor_never_charges_its_flags_to_another_file(self):
+        # A fake /proc/<pid> whose fd 7 is a symlink, like the real one; `_pin` follows it.
+        process = self.root / "proc"
+        (process / "fd").mkdir(parents=True)
+        (process / "fdinfo").mkdir()
+        output = self.root / "A.olean"
+        output.write_bytes(b"read-only output")
+        (process / "fd/7").symlink_to(output)
+        dev, ino = output.stat().st_dev, output.stat().st_ino
+        with open(output, "rb") as stream:
+            mount = canonical._fdinfo("/proc/self", str(stream.fileno()))["mnt_id"]
+        scan = SimpleNamespace(inodes=True, internal={"14"})
+
+        def fd(info):
+            (process / "fdinfo/7").write_text(info)
+            return canonical._descriptor(str(process), "7", scan)
+
+        def busy(found, key):
+            return canonical.Guard(writable=found).busy(SimpleNamespace(st_dev=key[0], st_ino=key[1]))
+
+        def pins(*observed):
+            # What fd 7 names at the pin before the fdinfo read and at the pin after it.
+            files = [
+                None
+                if o is None
+                else (o[0], o[1] and str(o[1]), SimpleNamespace(st_dev=o[2], st_ino=o[3], st_mode=stat.S_IFREG))
+                for o in observed
+            ]
+            return patch.object(canonical, "_pin", side_effect=files)
+
+        writable = "flags:\t0100002\nmnt_id:\t{}\nino:\t{}\n"
+        self.assertEqual(fd(f"flags:\t0100000\nmnt_id:\t{mount}\nino:\t{ino}\n"), set())  # Read-only.
+        self.assertEqual(fd(writable.format(mount, ino)), {(dev, ino), (None, ino)})
+        self.assertEqual(fd(writable.format("14", ino)), set())  # Pipes and sockets never count.
+        # The original false positive: read-only output O (inode 5) before the read, writable lock
+        # L (inode 6) at the read and after it. Only L is busy.
+        with pins((mount, 5, 10, 5), (mount, 6, 10, 6)):
+            found = fd(writable.format(mount, 6))
+        self.assertFalse(busy(found, (10, 5)))
+        self.assertTrue(busy(found, (10, 6)))
+        # Writable A before and at the read, then A moves to an already-scanned fd and B, sharing
+        # A's kernel inode in one overlayfs mount, takes this one: A stays busy.
+        with pins((mount, 42, 10, 42), (mount, 42, 20, 42)):
+            found = fd(writable.format(mount, 42))
+        self.assertTrue(busy(found, (10, 42)))
+        # NFS without 64-bit inode numbers: the kernel inode is not the reported `st_ino`, and the
+        # pin supplies the reported one.
+        kernel = (1 << 32) + 3
+        with pins((mount, kernel, 10, 3), None):
+            found = fd(writable.format(mount, kernel))
+        self.assertTrue(busy(found, (10, 3)))
+        # Out of descriptors: a pin is a plain stat of unknown identity, which still counts.
+        with pins((None, None, 10, 3), None):
+            found = fd(writable.format(mount, kernel))
+        self.assertTrue(busy(found, (10, 3)))
+        with pins((None, None, 10, 3)):
+            self.assertTrue(busy(fd("pos:\t0\n"), (10, 3)))
+        # Writable, then closed before either pin could see it: busy by inode.
+        with patch.object(canonical, "_pin", return_value=None):
+            self.assertEqual(fd(writable.format(mount, 6)), {(None, 6)})
+        self.assertEqual(fd("pos:\t0\n"), {(dev, ino)})  # Unreadable flags: the file pinned before.
+        (process / "fdinfo/7").unlink()  # Closed since listed.
+        self.assertEqual(canonical._descriptor(str(process), "7", scan), set())
+        # Kernels whose fdinfo names no inode judge each fd as main always did: stat first, and a
+        # file whose flags then cannot be read counts as writable.
+        scan.inodes = False
+        self.assertEqual(fd("flags:\t0100000\n"), set())
+        self.assertEqual(fd("flags:\t0100002\n"), {(dev, ino)})
+        (process / "fdinfo/7").unlink()
+        self.assertEqual(canonical._descriptor(str(process), "7", scan), {(dev, ino)})
+
+    def test_a_writer_handed_to_an_already_scanned_descriptor_stays_busy(self):
+        output = self.root / "A.olean"
+        output.write_bytes(b"being written")
+        writer = os.open(output, os.O_WRONLY)
+        spare = os.open(os.devnull, os.O_RDONLY)
+        self.addCleanup(os.close, spare)
+        scan = canonical._Scan()
+        fdinfo = canonical.Path.read_text
+
+        def hand_off(path, *args, **kwargs):
+            text = fdinfo(path, *args, **kwargs)
+            if path.name == str(writer):
+                os.dup2(writer, spare)  # The writer moves to a descriptor already scanned...
+                os.close(writer)  # ...and this one closes.
+            return text
+
+        with patch.object(canonical.Path, "read_text", hand_off):
+            found = canonical._descriptor(f"/proc/{os.getpid()}", str(writer), scan)
+        self.assertTrue(canonical.Guard(writable=set(found)).busy(output.stat()))
+
+    def test_the_live_scan_sees_our_writer_and_not_our_pipes(self):
+        output = self.root / "A.olean"
+        output.write_bytes(b"being written")
+        with open(output, "r+b"):
+            reader, writer = os.pipe()
+            self.addCleanup(os.close, reader)
+            self.addCleanup(os.close, writer)
+            found = canonical.open_for_writing()
+            self.assertTrue(canonical.Guard(writable=found).busy(output.stat()))
+        self.assertNotIn((None, os.fstat(writer).st_ino), found)
 
     def test_budget_and_host_slots_bound_relinking_and_it_resumes(self):
         modules = [f"TauCeti.M{i}" for i in range(4)]
@@ -896,7 +1124,16 @@ class Canonical(unittest.TestCase):
         totals = cache_storage.inventory([self.pool, checkout / ".lake"], details=details)
         row = details[(legacy.stat().st_dev, legacy.stat().st_ino)]
         self.assertEqual(row[1], 3)  # objects/, artifacts/ and the checkout: counted once.
-        self.assertEqual(sum(r["managed_bytes"] for r in totals.values()), sum(r[0] for r in details.values()))
+        # details keeps only hard-linked inodes; single-link files are totalled without being kept.
+        singles = sum(
+            info.st_blocks * 512
+            for root in (self.pool, checkout / ".lake")
+            for path in root.rglob("*")
+            if not path.is_symlink() and path.is_file() and (info := path.stat()).st_nlink == 1
+        )
+        self.assertEqual(
+            sum(r["managed_bytes"] for r in totals.values()), sum(r[0] for r in details.values()) + singles
+        )
         shutil.rmtree(checkout)
         for lease in (canonical.store(self.pool) / "uses").glob("*"):
             lease.unlink()
@@ -943,6 +1180,11 @@ class Canonical(unittest.TestCase):
         for path in (first, second):
             result = lake(path, "build", "Fx")
             self.assertEqual(result.returncode, 0, result.stdout)
+        try:
+            # Relinking defers every decision without the helper, so there is nothing to check.
+            cache.native(first, env, self.pool)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.skipTest(f"Lake hash helper cannot be built with {toolchain}: {error}")
         self.assertTrue(list(first.rglob("*.setup.json")))
         self.assertNotEqual(
             (first / ".lake/build/lib/lean/Fx/A.olean").stat().st_ino,

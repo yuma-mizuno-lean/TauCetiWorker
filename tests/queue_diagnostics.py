@@ -6,7 +6,8 @@ build job's log with bors-ng's `priv/failure_diagnostics.py` patterns, mapped to
 Covered: compiler errors in both the Lean and Lake forms with timestamps and ANSI stripped,
 duplicate declarations from the audit driver and the axioms script, environment linter locations
 (ranged, module-only, unknown), the failed-targets fallback used only without located findings,
-deduplication, a lost runner, and cancellation, timeouts and a failed finalizer as infrastructure.
+deduplication, a lost runner, the member review-size policy's per-member rejection records, and
+cancellation, timeouts and a failed finalizer as infrastructure.
 """
 
 import json
@@ -76,6 +77,25 @@ class ParseLog(unittest.TestCase):
         self.assertNotIn("\x1b", findings[0]["message"])
         self.assertFalse(findings[0]["message"].startswith("2026-"))
 
+    def test_lint_script_lines_in_the_compiler_shape_are_lint(self):
+        lines = [
+            "2026-11-19T04:20:00.1Z TauCeti/Topology/Covering/Quotient.lean:186:0: error: dot-notation namespace lint: "
+            "TauCeti.IsQuotientCoveringMap.foo puts a Mathlib type's namespace inside `namespace TauCeti`",
+            "2026-11-19T04:20:01.1Z error: TauCeti/Algebra/Basic.lean:12: Line has more than 100 characters",
+            "2026-11-19T04:20:02.1Z TauCeti/Algebra/Basic.lean:14:3: error: unknown identifier",
+        ]
+        findings = d.parse_log(lines)
+        self.assertEqual(
+            [(f["kind"], f["module"], f.get("linter")) for f in findings],
+            [
+                ("lint", "TauCeti.Topology.Covering.Quotient", "dot-notation"),
+                ("lint", "TauCeti.Algebra.Basic", "style"),
+                ("compiler", "TauCeti.Algebra.Basic", None),
+            ],
+        )
+        self.assertEqual(findings[0]["declaration"], "TauCeti.IsQuotientCoveringMap.foo")
+        self.assertEqual((findings[1]["path"], findings[1]["line_number"]), ("TauCeti/Algebra/Basic.lean", 12))
+
     def test_audits(self):
         lines = [
             "audit-driver: import TauCeti.A.B failed, environment already contains 'Foo.bar' from TauCeti.C.D",
@@ -88,6 +108,18 @@ class ParseLog(unittest.TestCase):
         )
         self.assertEqual(findings[0]["declaration"], "Foo.bar")
         self.assertEqual(findings[2]["path"], "TauCeti/E/F.lean")
+
+    def test_audit_collision_with_a_dependency_names_the_project_module(self):
+        # A Mathlib bump added a declaration the project already defines (batch 459, run 44442676966).
+        line = (
+            "2026-11-19T05:05:47.8653067Z audit-driver: import TauCeti.Topology.Algebra.Algebra.Unitization failed, "
+            "environment already contains 'Unitization.continuous_iff' from Mathlib.Analysis.Normed.Algebra.Unitization"
+        )
+        [finding] = d.parse_log([line])
+        self.assertEqual(kinds([finding]), [("audit", "TauCeti.Topology.Algebra.Algebra.Unitization")])
+        self.assertEqual(finding["path"], "TauCeti/Topology/Algebra/Algebra/Unitization.lean")
+        self.assertEqual(finding["declaration"], "Unitization.continuous_iff")
+        self.assertIn("Mathlib.Analysis.Normed.Algebra.Unitization", finding["message"])
 
     def test_environment_linter(self):
         payload = {
@@ -124,6 +156,30 @@ class ParseLog(unittest.TestCase):
         self.assertEqual(kinds(located), [("compiler", "TauCeti.A.B")])
         self.assertNotIn("located", located[0])
 
+    def test_lean_killed_by_signal_9_is_infrastructure(self):
+        module = "TauCeti.GroupTheory.SpecificGroups.Sporadic.Fischer.TwentyTwo.Presentation"
+        killed = (
+            "2026-11-20T08:40:07.7014941Z error: Lean process for /opt/actions-runner/_work/TauCeti/TauCeti/pr/"
+            + d.path_of(module)
+            + " was killed by signal 9 after 712s, likely out of memory"
+        )
+        targets = ["Some required targets logged failures:", "- " + module, "error: build failed"]
+        findings = d.parse_log([killed, "error: Lean exited with code 137", *targets])
+        self.assertEqual(kinds(findings), [("infrastructure", module)])
+        self.assertEqual(findings[0]["reason"], "lean_killed")
+        self.assertEqual(findings[0]["path"], d.path_of(module))
+        # Another failed target, or a located error elsewhere, is still a source finding.
+        other = d.parse_log([killed, *targets[:2], "- TauCeti.A.B", *targets[2:]])
+        self.assertEqual(kinds(other), [("compiler", "TauCeti.A.B"), ("infrastructure", module)])
+        located = d.parse_log(["TauCeti/A/B.lean:1:1: error: x", killed, *targets])
+        self.assertEqual(kinds(located), [("compiler", "TauCeti.A.B"), ("infrastructure", module)])
+        # A wall-clock timeout is the module's own failure.
+        timeout = killed.replace(
+            "was killed by signal 9 after 712s, likely out of memory",
+            "exceeded the 3000s wall-clock limit (TERM, then KILL after 30s)",
+        )
+        self.assertEqual(kinds(d.parse_log([timeout, *targets])), [("compiler", module)])
+
     def test_dedup_and_runner_loss(self):
         lines = ["TauCeti/A/B.lean:1:1: error: x"] * 3 + [
             "The runner has received a shutdown signal. This can happen when the runner service is stopped."
@@ -133,6 +189,36 @@ class ParseLog(unittest.TestCase):
         self.assertEqual(findings[1]["reason"], "runner_lost")
         self.assertEqual(d.parse_log([]), [])
         self.assertEqual(d.parse_log(["info: all good", "error: something else entirely"]), [])
+
+    def test_member_policy_rejections_name_the_member(self):
+        head = "a" * 40
+        record = {
+            "source_pr": 812,
+            "source": {"forge": {"kind": "forgejo", "url": "https://forge.invalid"}, "name": "o/r", "id": 9},
+            "source_forge": "forgejo:https://forge.invalid",
+            "head": head,
+            "reasons": ["+3400 added lines (cap 3000)"],
+            "additions": 3400,
+            "deletions": 3,
+            "files": 12,
+        }
+        lines = [
+            "2026-11-16T05:16:00.0000000Z MEMBER-POLICY-REJECTED " + json.dumps(record, sort_keys=True),
+            "MEMBER-POLICY-REJECTED " + json.dumps(record, sort_keys=True),
+            "MEMBER-POLICY-REJECTED {not json",
+            "MEMBER-POLICY-REJECTED " + json.dumps(dict(record, head="not-a-sha")),
+            "MEMBER-POLICY-REJECTED " + json.dumps(dict(record, source_pr="812")),
+            "::error::source member review-size policy rejected this candidate; inspect source-member-policy.json",
+        ]
+        [finding] = d.parse_log(lines)
+        self.assertEqual((finding["kind"], finding["module"]), ("policy", ""))
+        self.assertEqual((finding["source_pr"], finding["member_head"]), (812, head))
+        self.assertEqual(finding["source"]["forge"]["kind"], "forgejo")
+        self.assertEqual((finding["additions"], finding["files"]), (3400, 12))
+        self.assertIn("#812", finding["message"])
+        self.assertIn("+3400 added lines", finding["message"])
+        # Without the record (older TauCetiTools) nothing is invented.
+        self.assertEqual(d.parse_log(lines[-1:]), [])
 
     def test_message_bound(self):
         finding = d.parse_log(["TauCeti/A/B.lean:1:1: error: " + "x" * 5000])[0]
@@ -148,6 +234,12 @@ class Infrastructure(unittest.TestCase):
         ]
         findings = d.infrastructure_findings(run, jobs)
         self.assertEqual([f["reason"] for f in findings], ["cancelled", "cancelled", "finalizer_failed"])
+        # A stub caller of the reusable pr-build prefixes its job names.
+        prefixed = [{"name": "pr-build / finalize-merge-group-build", "conclusion": "failure"}]
+        self.assertEqual(
+            [f["reason"] for f in d.infrastructure_findings({"id": 7, "conclusion": "failure"}, prefixed)],
+            ["finalizer_failed"],
+        )
         self.assertTrue(all(f["kind"] == "infrastructure" for f in findings))
         self.assertEqual(
             d.infrastructure_findings(

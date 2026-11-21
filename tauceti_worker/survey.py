@@ -261,12 +261,15 @@ class PRInfo:
     updated_at: str = ""
     bump_integration_failed: bool = False
     self_tested: bool = False
+    # A failed `scope` status on this head. For a self-tested head, which skips PR CI, PR status
+    # posts it when the diff fails PR CI's size guards; queue admission refuses that head too.
+    scope_failed: bool = False
     work_targets: tuple[str, ...] = ()
     origin_pr: str = ""
 
     @property
     def review_ready(self) -> bool:
-        return self.build_success or self.self_tested
+        return self.build_success or (self.self_tested and not self.scope_failed)
 
     @property
     def needs_ci_repair(self) -> bool:
@@ -324,6 +327,7 @@ class PRInfo:
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
             self_tested=local,
+            scope_failed=any(c.get("context") == "scope" and c.get("state") in BUILD_FAIL for c in rollup),
             work_targets=work_target_keys(d.get("body", "")),
             origin_pr=origin_pr_url(d.get("body", "")),
             bump_integration_failed=any(
@@ -405,6 +409,10 @@ class Survey:
     dependency_wait: dict | None = None
     discovery_gaps: int = 0  # diagnostic only; partial history never stops work selection
     discovery_gap_prs: list[int] = field(default_factory=list)
+    # A native source survey's per-PR review-history reads (at most SURVEY_DETAIL_READS), and the PRs
+    # it left unclassified because no cached observation describes their current state. Diagnostic.
+    detail_reads: int = 0
+    detail_deferred: int = 0
     errors: list[str] = field(default_factory=list)
     # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
     # can't review them and CI's round cap can't catch them (rounds never advance), so each round
@@ -432,6 +440,10 @@ class Survey:
     def owns(self, pr: PRInfo) -> bool:
         # Qualified source records cannot fall back to a GitHub display login.
         return not hasattr(pr, "source_repository") and pr.author == self.me_login
+
+    def authored(self, pr: PRInfo) -> bool:
+        """PRs this identity opened itself: authoring pressure and "mine" counts use these."""
+        return self.owns(pr)
 
     def kind(self, name: str) -> WorkKind:
         return {
@@ -978,7 +990,7 @@ def classify_survey(
     ]
     me_login = sv.me_login or me()
     sv.me_login = me_login
-    mine = [p for p in nondraft if sv.owns(p)]
+    mine = [p for p in nondraft if sv.authored(p)]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
     bot_on_canonical = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and any(
@@ -1010,7 +1022,7 @@ def classify_survey(
     sv.rescope_roadmap()
     # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
     # total with the subset this identity authored, for the per-round "open PRs" line.
-    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.owns)
+    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.authored)
 
     # 1) rebase: tended (ours or bot-authored), conflicting or a sweep handoff for
     #    this exact head, under the per-PR budget since last verified progress.
@@ -1135,6 +1147,8 @@ def classify_survey(
                 (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
             continue
         m = rs.gh_meta(p.number)
+        if m.provenance == "deferred":
+            continue  # unread this survey (detail budget spent); a later survey reads it
         if m.provenance in {"stale", "fetch_failed"}:
             gaps.add(p.number)
             continue
@@ -1227,6 +1241,9 @@ def classify_survey(
                     ).append(c)
                 continue
             meta = rs.gh_meta(p.number)
+            if meta.provenance == "deferred":
+                sv.fix_waiting.append((p.number, "review state not read this survey"))
+                continue
             blocking = rs.ledger_blocking(p.number, p.head_oid)
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
             pending_contest = False
@@ -1383,17 +1400,30 @@ def bump_prs(sv: Survey) -> set[int]:
     return {p.number for p in sv.open_prs if p.automatic_bump}
 
 
-def cascade(sv: Survey, stages) -> list[tuple[str, Candidate]]:
+def cascade(sv: Survey, stages, listed=frozenset()) -> list[tuple[str, Candidate]]:
     """Actionable (stage, candidate) pairs in the order a round offers them.
 
     Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
     red build, review findings and pending reviews. Main moves faster than an ordinary queue
     position allows a bump round to start, so a bump that waits behind unrelated work goes stale
     again before it can be admitted. Everything else follows in the usual stage order.
+
+    Within each maintenance/review stage, prefer this account's listed PRs among its own
+    non-bump positions. Other authors and automatic bumps keep their positions; no candidate
+    moves across stages, so target priority cannot overtake lint repair or progress reports.
     """
     bumps = bump_prs(sv)
     pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
-    return [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+    pairs = [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+    if not listed:
+        return pairs
+    own = {p.number for p in sv.open_prs if sv.owns(p)} - bumps
+    for stage in ("rebase", "fix-ci", "fix", "review"):
+        slots = [i for i, (kind, c) in enumerate(pairs) if kind == stage and c.pr in own]
+        ranked = sorted((pairs[i] for i in slots), key=lambda pair: pair[1].pr not in listed)
+        for i, pair in zip(slots, ranked, strict=True):
+            pairs[i] = pair
+    return pairs
 
 
 def _next_auto_stage(sv: Survey) -> str | None:
