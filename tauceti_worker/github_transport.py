@@ -141,6 +141,10 @@ def note_cache_hit():
     _cache_hit.set(True)
 
 
+class LockWaitExpired(OSError):
+    """Another process held a shared lock for the whole wait."""
+
+
 @contextlib.contextmanager
 def locked(path: Path, *, timeout: float = 30):
     import fcntl
@@ -154,7 +158,7 @@ def locked(path: Path, *, timeout: float = 30):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise OSError("shared GitHub lock wait expired") from None
+                    raise LockWaitExpired("shared GitHub lock wait expired") from None
                 time.sleep(0.05)
         yield
 
@@ -334,6 +338,19 @@ def update_shared(key, mutate, *, identity, generation_scope, lock_timeout: floa
         return False
 
 
+def stored_shared(key, *, identity):
+    """The value last stored under `key`, whatever its age or generation, as the base of an
+    incremental refresh, never as an answer. None when there is none or this context bypasses
+    the shared cache."""
+    if not identity or _fresh.get() or os.environ.get("TAUCETI_GITHUB_CACHE_BYPASS") == "1":
+        return None
+    try:
+        cached = json.loads(_shared_path(key, identity).read_text())
+        return cached["value"] if cached.get("revision", "") == _revision.get() else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def shared_read(
     key,
     fetch,
@@ -344,13 +361,17 @@ def shared_read(
     lock_timeout: float = 30,
     generation_scope=None,
     coalesce_failures: bool = False,
+    keep_base: bool = False,
 ):
     """Coalesce a complete logical read under a per-key lock. Never cache failures.
 
     Network/parser exceptions propagate; unavailable storage merely disables caching. Generation
     checks prevent an overlapping write from publishing a pre-write result after invalidation.
     Explicit generation scopes use invalidate_shared rather than unrelated GitHub writes.
-    Opt-in completion markers share unavailable reads only with existing waiters.
+    Opt-in completion markers share unavailable reads only with existing waiters, and a waiter
+    whose lock wait expires behind a running leader is unavailable rather than a second fetch.
+    With `keep_base`, a value that a write invalidated while it was fetched is still stored, under
+    the generation it began in, so it never answers a read but stays a base for stored_shared.
     The default invokes each caller's fetch after failures, preserving fetch side effects.
     """
     identity = identity or scope()
@@ -390,6 +411,12 @@ def shared_read(
     try:
         cm = locked(path.with_suffix(".lock"), timeout=lock_timeout)
         cm.__enter__()
+    except LockWaitExpired:
+        if coalesce_failures:
+            # The leader is still fetching. A second fetch would only compete with it (every
+            # waiter of a slow full listing would start its own), so this wait is unavailable.
+            return None
+        return fetch()
     except OSError:
         return fetch()
     try:
@@ -441,13 +468,13 @@ def shared_read(
                 value = fetch()
                 saved = False
                 generation_current = immutable or current_generation() == epoch
-                if value is not None and generation_current:
+                if value is not None and (generation_current or keep_base):
                     try:
                         atomic(
                             path,
                             {"time": time.time(), "generation": epoch, "revision": _revision.get(), "value": value},
                         )
-                        saved = True
+                        saved = generation_current
                     except OSError:
                         pass
                 if saved:

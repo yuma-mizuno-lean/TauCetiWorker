@@ -2,10 +2,11 @@
 
 Every repair, preparation and rebase verification runs the check set staging runs: the final
 build, then the compiled audit driver (import, duplicates, axioms), the module-system check, the
-full environment lint, the style lint and the dot-notation lint, all at once. Without frozen
-GitHub lint-scope policy, use staging's conservative full-library fallback. Every finding of one
-round returns to the existing repair loop together; staging remains the authoritative landing
-verdict.
+environment lint, the style lint and the dot-notation lint, all at once. The environment lint
+first covers only the modules changed since the base, as an ordinary PR's preflight does; when
+that round finds nothing in any check, the whole-library lint runs before the checks pass, so a
+pass always includes it. Every finding of one round returns to the existing repair loop
+together; staging remains the authoritative landing verdict.
 
 Check phases and sampled process-tree RSS are measured in existing task logs. The compiled checks
 read the build outputs through read-only mounts while they run together under the caller's build
@@ -39,6 +40,13 @@ URL_VARIABLE = "TAUCETI_QUEUE_TOOLS_URL"  # a ``{repo}`` template; tests point i
 DEFAULT_URL = "https://github.com/{repo}.git"
 ENABLE_VARIABLE = "TAUCETI_QUEUE_WORKER_AUDITS"
 AUDIT_TIMEOUT_SECONDS = 3000  # sandbox-build.sh's liveness budget for the audit driver
+# The most changed modules the first environment lint covers before the whole-library lint takes
+# its place. In changed-only mode ``lint-env.sh`` writes every selected module into one
+# ``#[`A, `B, ...]`` array literal in its docstring-scan driver, and Lean's code generator stops
+# with "maximum recursion depth reached" a little under 3,000 elements (v4.37.0-rc1, real
+# TauCeti module names). Half that keeps a margin for longer names and toolchain changes.
+CHANGED_LINT_MODULE_LIMIT = 1500
+DRIVER_FAILURE = "LINT-ENV: FAIL \u2014 driver failure"  # lint-env.sh's fail() line for its own drivers
 MODULE_PATH = re.compile(r"^TauCeti(/[A-Za-z_][A-Za-z0-9_']*)+\.lean$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -335,6 +343,14 @@ def findings_of(kind: str, name: str, run: dict) -> list[dict]:
     return found
 
 
+def driver_failure(run: dict, findings: list[dict]) -> bool:
+    """Whether an environment-lint run ended in ``lint-env.sh``'s driver failure with no finding that
+    names a module (such as the docstring-scan driver failing to compile its module list)."""
+    if run["rc"] == 0 or any(f.get("module") for f in findings):
+        return False
+    return any(DRIVER_FAILURE in line for line in run["output"].splitlines())
+
+
 def check(
     worktree: Path,
     env: dict,
@@ -347,9 +363,11 @@ def check(
 ) -> dict:
     """Staging's checks over the environment already built in ``worktree``, all at once; the caller
     holds the build lock. These are the audit driver (import, duplicates, axioms), the module-system
-    check, the full environment lint, the style lint and the dot-notation lint. ``status`` is
-    ``passed``, ``failed`` (``diagnostics`` lists every check's findings in the controller's shape) or
-    ``unavailable`` (``reason``)."""
+    check, the environment lint, the style lint and the dot-notation lint. The environment lint covers
+    the modules changed since ``base`` first and the whole library once nothing else is found, so
+    ``lint.scope`` is ``changed`` only on a failed round. ``status`` is ``passed``, ``failed``
+    (``diagnostics`` lists every check's findings in the controller's shape) or ``unavailable``
+    (``reason``)."""
     started = time.monotonic()
     record: dict = {"status": "passed", "diagnostics": []}
     work = worktree / WORK_DIR
@@ -359,6 +377,7 @@ def check(
         record["tools"] = f"{repo}@{ref}"
         checkout = tools_checkout(tools_root, repo, ref)
         ref = checkout.name  # the exact commit, which keys the compiled drivers
+        record["tools_commit"] = f"{repo}@{ref}"
         record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
         materialize_started = time.monotonic()
         scripts = materialize(checkout, worktree, work / "scripts")
@@ -388,15 +407,28 @@ def check(
     record["audit_phases_file"] = str(phase_record)
     audit_argv = [*lake, "env", "timeout", "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s"]
     project = {"TAUCETI_PROJECT_ROOT": worktree, "TAUCETI_TRUSTED_SCRIPTS": scripts, "LINT_CHANGED_ONLY": "0"}
-    # The task has no frozen GitHub label/branch policy that could justify scoped
-    # lint. Use staging's conservative full-library fallback, including unchanged
-    # declarations affected by new simp lemmas or other global environment changes.
-    lint_env = {
+    full_lint_env = {
         **project,
         "LINT_DRIVER_EXE": drivers / "lint-env-driver",
         "LINT_ONLY_MODULES": "",
         "TAUCETI_LINT_PROFILE": env.get("TAUCETI_LINT_PROFILE", "0"),
     }
+    # The first lint covers the changed modules (staging's PR preflight scope). It misses findings
+    # in unchanged declarations, such as a new simp lemma breaking an old one's simp normal form,
+    # so a round that finds nothing ends with the whole-library lint below.
+    lint_env = full_lint_env
+    try:
+        modules = changed_modules(worktree, base)
+    except (Unavailable, OSError, subprocess.SubprocessError):
+        modules = None
+    if modules is not None and len(modules) > CHANGED_LINT_MODULE_LIMIT:
+        # Too many for the changed-only driver: the whole-library lint (CI's own scope) covers them.
+        record["changed_lint"] = {"skipped": "module_limit", "modules": len(modules)}
+        modules = None
+    if modules is not None:
+        scope_file = work / "lint-modules.txt"
+        scope_file.write_text("".join(m + "\n" for m in modules))
+        lint_env = {**full_lint_env, "LINT_ONLY_MODULES": scope_file, "LINT_CHANGED_ONLY": "1"}
     dot_notation = [
         "python3",
         scripts / "lint-dot-notation.py",
@@ -439,11 +471,34 @@ def check(
             shutil.copyfile(phases_path, phase_record)
     with contextlib.suppress(OSError):
         shutil.copyfile(phases_path, logdir / "audit-phases.tsv")
-    for name, kind, _, _, log, _ in jobs:
-        found = findings_of(kind, log.removesuffix(".log"), runs[name])
-        record[name] = {k: v for k, v in runs[name].items() if k != "output"} | {"findings": len(found)}
-        record["diagnostics"] += found
-    record["lint"]["scope"] = "full"
+    found = {name: findings_of(kind, log.removesuffix(".log"), runs[name]) for name, kind, _, _, log, _ in jobs}
+    scope = "full"
+    if modules is not None:
+        scope = "changed"
+        # A changed-only run that failed in its own driver, naming no module, gives the repair
+        # nothing to fix; the whole-library lint replaces it whatever the other checks found.
+        driver_failed = driver_failure(runs["lint"], found["lint"])
+        if driver_failed or not any(found.values()):
+            record["changed_lint"] = {k: v for k, v in runs["lint"].items() if k != "output"} | {
+                "modules": len(modules)
+            }
+            if driver_failed:
+                record["changed_lint"]["skipped"] = "driver_failure"
+            runs["lint"] = _sandboxed(
+                ["bash", scripts / "lint-env.sh"],
+                worktree,
+                env,
+                full_lint_env,
+                logdir / "lint-env.log",
+                timeout,
+                read_only_build=True,
+            )
+            found["lint"] = findings_of("lint", "lint-env", runs["lint"])
+            scope = "full"
+    for name, *_ in jobs:
+        record[name] = {k: v for k, v in runs[name].items() if k != "output"} | {"findings": len(found[name])}
+        record["diagnostics"] += found[name]
+    record["lint"]["scope"] = scope
     record["status"] = "failed" if record["diagnostics"] else "passed"
     record["seconds"] = round(time.monotonic() - started, 1)
     with contextlib.suppress(OSError):

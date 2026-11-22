@@ -49,7 +49,19 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-TMP = Path(tempfile.mkdtemp(prefix="queue-repair-task-"))
+
+# TemporaryDirectory removes its tree when it is closed or at exit, read-only parts included.
+# Every other temporary directory this process makes, the worker's own included, lies inside it.
+SCRATCH = tempfile.TemporaryDirectory(prefix="queue-repair-task-", ignore_cleanup_errors=True)
+TMP = Path(SCRATCH.name)
+tempfile.tempdir = str(TMP)
+
+
+def scratch(test: unittest.TestCase, prefix: str) -> Path:
+    """A fresh directory under ``TMP`` that is removed when ``test`` finishes."""
+    return Path(test.enterContext(tempfile.TemporaryDirectory(prefix=prefix, ignore_cleanup_errors=True)))
+
+
 BIN = TMP / "bin"
 BIN.mkdir()
 HOME = TMP / "home"
@@ -548,7 +560,8 @@ for name, text in (
 # policy files, as the real setup step does. The driver builders write stand-in executables; the
 # ``audit-driver`` prints the lines of ``$STUB_DIR/audit-findings`` once (the file is then renamed, as if the
 # agent's fix removed the duplicate) or of ``$STUB_DIR/audit-findings-always`` on every run, exiting 1 when
-# it printed any; ``lint-env.sh`` records its scope and does the same with ``lint-findings``. ``lint-style.sh``
+# it printed any; ``lint-env.sh`` records its scope (also appended to ``lint-runs.log``) and does the same with ``lint-findings``,
+# printing ``lint-driver-failure`` and failing on every changed-only run while that file exists. ``lint-style.sh``
 # and ``lint-dot-notation.py`` print ``$STUB_DIR/style-findings`` and ``$STUB_DIR/dot-notation-findings``.
 
 TOOLS_MAIN = r"""
@@ -619,7 +632,10 @@ TOOLS_SCRIPTS = {
     "lint-env.sh": (
         'if [ -n "$LINT_ONLY_MODULES" ]; then cp "$LINT_ONLY_MODULES" "$STUB_DIR/lint-scope.txt"; '
         'else find TauCeti -name "*.lean" | sort | sed "s|/|.|g;s|.lean$||" > "$STUB_DIR/lint-scope.txt"; fi\n'
+        'echo "${LINT_CHANGED_ONLY:-0}" $(cat "$STUB_DIR/lint-scope.txt") >> "$STUB_DIR/lint-runs.log"\n'
         'test -x "$LINT_DRIVER_EXE" || { echo "LINT-ENV: FAIL no driver"; exit 1; }\n'
+        'if [ "${LINT_CHANGED_ONLY:-0}" = 1 ] && [ -f "$STUB_DIR/lint-driver-failure" ]; then '
+        'cat "$STUB_DIR/lint-driver-failure"; exit 1; fi\n'
         'if [ -f "$STUB_DIR/lint-findings" ]; then cat "$STUB_DIR/lint-findings"; mv "$STUB_DIR/lint-findings" '
         '"$STUB_DIR/lint-findings.reported"; echo "LINT-ENV: FAIL"; exit 1; fi\n'
         'echo "LINT-ENV: PASS"\n'
@@ -690,6 +706,78 @@ def commit_on(repo: Path, parent: str, files: dict[str, str]) -> str:
             sh(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=env)
         tree = sh(repo, "write-tree", env=env)
     return sh(repo, "commit-tree", tree, "-p", parent, "-m", "fixture")
+
+
+class ApplicableResolution(unittest.TestCase):
+    """``applicable_resolution`` reuses a stored resolution only for the same conflict."""
+
+    def test_a_directory_rename_on_the_new_prefix_is_another_conflict(self):
+        """The member adds ``old/new`` and conflicts in ``X.lean``. The stored resolution's prefix deleted
+        ``old/a``; the new prefix moved it to ``new/a``, so cherry-picking the member there moves
+        ``old/new`` too. The prefixes agree in every path the member and the resolution change, yet
+        the conflict differs, and the entry is not reused. A prefix that differs elsewhere reuses it."""
+        repo = Path(tempfile.mkdtemp(prefix="applicable-resolution-"))
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        sh(repo, "init", "--quiet")
+        sh(repo, "config", "user.email", "test@example.com")
+        sh(repo, "config", "user.name", "test")
+        base = commit(repo, "base", {"old/a": "a\n", "X.lean": "x\n", "Y.lean": "y\n"})
+        member = commit(repo, "member", {"old/new": "new\n", "X.lean": "x, member\n"})
+
+        def prefix(message: str, files: dict[str, str], remove: tuple[str, ...] = ()) -> str:
+            sh(repo, "checkout", "--quiet", "--detach", base)
+            for path in remove:
+                sh(repo, "rm", "--quiet", path)
+            return commit(repo, message, {"X.lean": "x, main\n", **files})
+
+        made_on = prefix("main deletes old/a", {}, remove=("old/a",))
+        resolved = commit(repo, "resolution", {"X.lean": "x, main and member\n"})
+        sh(repo, "update-ref", repair_task.resolution_ref("7", member, chain_tool.tree_of(repo, made_on)), resolved)
+        renamed = prefix("main moves old/a", {"new/a": "a\n"}, remove=("old/a",))
+        self.assertIsNone(repair_task.applicable_resolution(repo, "7", member, renamed))
+        elsewhere = prefix("main changes Y.lean", {"Y.lean": "y, main\n"}, remove=("old/a",))
+        self.assertEqual(repair_task.applicable_resolution(repo, "7", member, elsewhere), resolved)
+        self.assertIsNone(repair_task.applicable_resolution(repo, "8", member, elsewhere), "another batch's")
+
+
+class AbsorbedMembers(unittest.TestCase):
+    """``absorbed_members`` judges only the later members that change a path the resolution changes."""
+
+    def test_only_members_on_the_resolutions_paths_are_merged(self):
+        """Member 1 conflicts with main in ``Shared.lean``; member 2 adds ``B.lean`` and member 3 edits
+        ``X.lean``. A resolution that also writes member 3's ``X.lean`` absorbs it, and only member 3 is
+        merged to find that out; a resolution of ``Shared.lean`` alone merges no later member at all."""
+        repo = Path(tempfile.mkdtemp(prefix="absorbed-members-"))
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        sh(repo, "init", "--quiet")
+        sh(repo, "config", "user.email", "test@example.com")
+        sh(repo, "config", "user.name", "test")
+        base = commit(repo, "base", {"Shared.lean": "shared\n", "X.lean": "x\n"})
+        one = commit(repo, "one\n\nSource-PR: o/r#1", {"Shared.lean": "shared, one\n"})
+        commit(repo, "two\n\nSource-PR: o/r#2", {"B.lean": "b\n"})
+        tip = commit(repo, "three\n\nSource-PR: o/r#3", {"X.lean": "x, three\n"})
+        sh(repo, "checkout", "--quiet", "--detach", base)
+        prefix = commit(repo, "main", {"Shared.lean": "shared, main\n"})
+        clean = commit_on(repo, prefix, {"Shared.lean": "shared, main and one\n"})
+        absorbing = commit_on(repo, prefix, {"Shared.lean": "shared, main and one\n", "X.lean": "x, three\n"})
+        rest = chain_tool.ChainResult(
+            status=chain_tool.CLEAN, chain_id="t", ref="t", base=prefix, tip=clean, commits=[]
+        )
+        merged: list[str] = []
+        original = chain_tool.merge_trees
+
+        def counting(repo_, ours, theirs, merge_base=None):
+            merged.append(theirs)
+            return original(repo_, ours, theirs, merge_base=merge_base)
+
+        with patch.object(chain_tool, "merge_trees", counting):
+            self.assertEqual(repair_task.absorbed_members(repo, prefix, one, clean, tip, rest), [])
+            self.assertEqual(merged, [], "no later member changes Shared.lean")
+            problems = repair_task.absorbed_members(repo, prefix, one, absorbing, tip, rest)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("o/r#3", problems[0])
+        self.assertEqual(set(merged), {tip}, "member 2 is never merged")
+        self.assertEqual(repair_task.absorbed_members(repo, prefix, one, prefix, tip, rest), [], "an empty resolution")
 
 
 class Content:
@@ -1130,7 +1218,7 @@ class Fixture(unittest.TestCase):
     MEMBER_FILES: dict[int, dict[str, str]] | None = None  # more files in a member's commit, by number
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="case-", dir=TMP))
+        self.root = scratch(self, "case-")
         self.content = Content(
             self.root, broken=self.BROKEN, base_files=self.BASE_FILES, member_files=self.MEMBER_FILES
         )
@@ -1811,8 +1899,9 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(sh(clone, "show", f"{sha}:TauCeti/Other.lean"), "-- elsewhere")
 
     def test_the_lookahead_skips_a_member_an_earlier_run_resolved(self):
-        """After a restart a member resolved on its prefix by the earlier run is the replay's to reuse:
-        no helper resolves it again on ``onto``."""
+        """After a restart a member resolved by an earlier run or task of the batch, on a prefix with
+        ``onto``'s content in the paths it and its resolution change, is the replay's to reuse: no
+        helper resolves it again on ``onto``. One resolved from other content is not."""
         from tauceti_queue import repair_lookahead
 
         seed = self.content.bare.parent / "seed"
@@ -1832,12 +1921,14 @@ class RebaseArtifacts(Fixture):
             return [c.sha for c in repair_lookahead.Lookahead.candidates(lookahead, self.content.members[1]["commit"])]
 
         self.assertEqual(candidates(), [three])
-        sh(
-            clone,
-            "update-ref",
-            repair_task.resolution_ref("1", three, chain_tool.tree_of(clone, self.onto) + "x"),
-            three,
-        )
+
+        def store(prefix: str) -> None:
+            resolved = commit_on(clone, prefix, {"TauCeti/Three.lean": "-- three, resolved\n"})
+            sh(clone, "update-ref", repair_task.resolution_ref("7", three, chain_tool.tree_of(clone, prefix)), resolved)
+
+        store(commit_on(clone, self.onto, {"TauCeti/Three.lean": "-- three, elsewhere\n"}))
+        self.assertEqual(candidates(), [three], "resolved from another Three.lean")
+        store(commit_on(clone, self.onto, {"TauCeti/Two.lean": "-- an earlier member\n"}))
         self.assertEqual(candidates(), [])
 
     def test_a_stopped_task_resumes_after_its_last_resolution(self):
@@ -1909,6 +2000,44 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(contents(outcome["tip"]), contents(reference[-1].sha), "the same chain")
         self.assertEqual(stored(), [])
 
+    def test_a_later_task_of_the_batch_reuses_a_resolution_from_the_same_inputs(self):
+        """Task 1 resolves member 2 and is superseded with its resolution stored. Task 2 of the batch
+        rebases onto a target that moved in another file: member 2's conflict has the same inputs, so
+        the resolution is merged onto the new prefix and checked, and the agent is not run. Task 3's
+        target moved in member 2's file: the conflict differs and goes to the agent."""
+        cfg = self.config()
+        clone = self.content.clone
+        two = self.content.members[1]["commit"]
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        resolved = outcome["conflicts"][0]["resolved"]
+        left = repair_task.resolution_ref("7", two, chain_tool.tree_of(clone, f"{resolved}^"))
+        sh(clone, "update-ref", left, resolved)  # what a superseded task leaves
+        seed = self.content.bare.parent / "seed"
+
+        def rerun(task_id: int, files: dict[str, str]) -> dict:
+            sh(seed, "checkout", "--quiet", "--detach", self.onto)
+            moved = commit(seed, f"main moved for task {task_id}", files)
+            sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+            self.service.tasks = {task_id: {**self.raw, "task_id": task_id, "onto": moved}}
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+            self.assertEqual(outcome["status"], "adopted", outcome)
+            return outcome
+
+        outcome = rerun(2, {"TauCeti/Other.lean": "-- elsewhere on main\n"})
+        self.assertEqual(len(self.agent_calls()), 1, "task 2 runs no agent")
+        self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [True])
+        self.assertEqual(sh(clone, "for-each-ref", repair_task.RESOLUTION_PREFIX), "")
+        reused = outcome["conflicts"][0]["resolved"]
+        self.assertEqual(
+            sh(clone, "show", f"{reused}:TauCeti/Two.lean"), sh(clone, "show", f"{resolved}:TauCeti/Two.lean")
+        )
+
+        sh(clone, "update-ref", left, resolved)
+        outcome = rerun(3, {"TauCeti/Two.lean": "-- two, on main again\n"})
+        self.assertEqual(len(self.agent_calls()), 2, "task 3's conflict goes to the agent")
+        self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [False])
+
     def test_a_stored_resolution_that_does_not_match_is_not_used(self):
         """An entry naming another commit's resolution under this commit's key is not reused: the agent
         resolves the conflict and the entry is dropped."""
@@ -1917,7 +2046,7 @@ class RebaseArtifacts(Fixture):
         sh(clone, "fetch", "--quiet", str(self.content.bare), self.onto, self.content.tip)
         prefix = chain_tool.replay(clone, self.content.base, self.content.members[0]["commit"], self.onto).tip
         conflicting = self.content.members[1]["commit"]
-        ref = repair_task.resolution_ref("1", conflicting, chain_tool.tree_of(clone, prefix))
+        ref = repair_task.resolution_ref("7", conflicting, chain_tool.tree_of(clone, prefix))
         sh(clone, "update-ref", ref, self.content.members[2]["commit"])
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
@@ -5054,7 +5183,7 @@ class ErrorParsing(unittest.TestCase):
 
 class Records(unittest.TestCase):
     def test_a_pathless_verification_finding_reaches_the_next_repair_prompt(self):
-        root = Path(tempfile.mkdtemp(prefix="pathless-", dir=TMP))
+        root = scratch(self, "pathless-")
         content = Content(root)
         task = repair_task.Task.from_json({**content.task(12), "claim_token": "x", "expires_at": time.time() + 60})
         seed = root / "seed"
@@ -5069,7 +5198,7 @@ class Records(unittest.TestCase):
         self.assertIn("the repaired chain failed verification", prompt)
 
     def test_a_pre_rebase_prompt_lists_the_errors_its_preparation_left(self):
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         content = Content(root)
         raw = content.task(12, kind="pre_rebase")
         seed = root / "seed"
@@ -5088,7 +5217,7 @@ class Records(unittest.TestCase):
         self.assertIn("- `TauCeti/Two.lean:3:5`: unknown identifier `x`", prompt)
 
     def test_a_preparation_reports_the_errors_no_worker_build_showed_fixed(self):
-        worktree = Path(tempfile.mkdtemp(prefix="remaining-", dir=TMP))
+        worktree = scratch(self, "remaining-")
         listings = repair.listings_path(worktree).parent
         listings.mkdir(parents=True)
         (listings / repair_stream.ERRORS_FILE).write_text(
@@ -5110,7 +5239,7 @@ class Records(unittest.TestCase):
         )
 
     def test_task_record_and_prompt_for_a_pre_rebase(self):
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         content = Content(root)
         raw = content.task(11, kind="pre_rebase")
         seed = root / "seed"
@@ -5174,7 +5303,7 @@ class Records(unittest.TestCase):
         )
 
     def test_a_no_repair_member_is_listed_under_do_not_edit(self):
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         content = Content(root)
         raw = content.task(12)
         raw["members"] = [dict(m, no_repair=m["number"] == 2) for m in raw["members"]]
@@ -5244,7 +5373,7 @@ class Records(unittest.TestCase):
     def test_ownership_spans_the_replayed_prefix_and_the_input_commit(self):
         """A conflict's chain is the replayed prefix followed by the input chain's conflicting commit, which
         are not one history: each commit is judged against its own parent."""
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         shared = "".join(f"line {i}\n" for i in range(10))
         content = Content(
             root,
@@ -5265,7 +5394,7 @@ class Records(unittest.TestCase):
         self.assertEqual(repair.owners_of(seed, chain, "TauCeti/A.lean"), [])
 
     def test_task_record_and_prompt_for_a_rebase_conflict(self):
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         content = Content(root)
         raw = content.task(9, kind="rebase_conflict")
         seed = root / "seed"
@@ -5341,7 +5470,7 @@ class Records(unittest.TestCase):
     def test_the_worker_commits_the_working_tree_and_discards_what_the_agent_did_to_history(self):
         """The agent resolves one commit; whatever it does to HEAD, the index, refs or history, the result is
         the working tree committed by the worker on the clean prefix, with the member's own message."""
-        root = Path(tempfile.mkdtemp(prefix="resolve-", dir=TMP))
+        root = scratch(self, "resolve-")
         content = Content(root)
         seed = root / "seed"
         sh(seed, "checkout", "--quiet", "--detach", content.base)
@@ -5410,7 +5539,7 @@ class Records(unittest.TestCase):
         self.assertEqual(again, tip, "the same files and explanation make the same commit")
 
     def test_the_check_script_judges_the_chain(self):
-        root = Path(tempfile.mkdtemp(prefix="check-", dir=TMP))
+        root = scratch(self, "check-")
         content = Content(root)
         seed = root / "seed"
         onto = content.base
@@ -5466,7 +5595,7 @@ class Records(unittest.TestCase):
         self.assertEqual(run(), (1, f"2 commits on {onto[:12]} for 3 recorded members"))
 
     def test_a_large_batch_prompt_stays_short(self):
-        root = Path(tempfile.mkdtemp(prefix="large-", dir=TMP))
+        root = scratch(self, "large-")
         seed = root / "seed"
         subprocess.run(["git", "init", "--quiet", "-b", "main", str(seed)], check=True)
         sh(seed, "config", "user.name", "Fixture")
@@ -5617,7 +5746,7 @@ class Records(unittest.TestCase):
             os.environ.pop("STUB_GH_ADMIN", None)
 
     def test_chain_report_flags_unexplained_edits(self):
-        root = Path(tempfile.mkdtemp(prefix="report-", dir=TMP))
+        root = scratch(self, "report-")
         content = Content(root)
         seed = root / "seed"
         sh(seed, "checkout", "--quiet", "--detach", content.base)
@@ -5639,7 +5768,7 @@ class Records(unittest.TestCase):
         self.assertTrue(any("unknown-member" in p for p in short["problems"]))
 
     def test_an_admin_labelled_large_refactor_member_is_measured_without_the_size_caps(self):
-        root = Path(tempfile.mkdtemp(prefix="large-refactor-", dir=TMP))
+        root = scratch(self, "large-refactor-")
         content = Content(root)
         seed = root / "seed"
         sh(seed, "checkout", "--quiet", "--detach", content.base)
@@ -5692,7 +5821,7 @@ class Records(unittest.TestCase):
         self.assertEqual((rc, json.loads(measured)["large_refactor"]), (0, True))
 
     def test_the_review_size_policy_measures_each_commit_against_its_parent_and_accepts_a_split(self):
-        root = Path(tempfile.mkdtemp(prefix="review-size-", dir=TMP))
+        root = scratch(self, "review-size-")
         content = Content(root)
         seed = root / "seed"
         sh(seed, "checkout", "--quiet", "--detach", content.base)
@@ -5889,7 +6018,12 @@ class WorkerAudits(Fixture):
         cfg = self.config(poll_seconds=0, verify_retries=0)
         client = self.client(cfg)
         finding = {"kind": "lint", "path": "TauCeti/Two.lean", "message": "unused argument"}
-        failed = {"ok": False, "build": {"rc": 0}, "checks": {"status": "failed"}, "diagnostics": [finding]}
+        failed = {
+            "ok": False,
+            "build": {"rc": 0},
+            "checks": {"status": "failed", "tools": "org/Tools@main", "tools_commit": "org/Tools@" + "e" * 40},
+            "diagnostics": [finding],
+        }
         submit = client.submit
 
         def lost(*args, **kwargs):
@@ -5906,6 +6040,11 @@ class WorkerAudits(Fixture):
         tip = pending["repair_checkpoint"]["tip"]
         self.assertEqual(self.service.done, set())
         self.assertEqual(len(self.service.results), 1)
+        # What the queue's stall detection reads: the code that produced the checkpoint and the agent's own word.
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        self.assertEqual(notes["worker_revision"], repair_task.STARTUP_REVISION)
+        self.assertEqual(notes["tools_revision"], "org/Tools@" + "e" * 40)
+        self.assertEqual(notes["agent_conclusion"], "done")
         before = (len(self.agent_calls()), len(self.lake_calls()))
         [saved] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(saved["reason"], "repair-checkpoint", saved)
@@ -6119,6 +6258,74 @@ class WorkerAudits(Fixture):
         self.assertEqual(outcome["verification"][0]["checks"]["lint"]["findings"], 1)
         prompt = self.agent_calls()[1]["prompt"]
         self.assertIn("- linter `simpNF`: `two` in `TauCeti/Two.lean` (PR #2's commit", prompt)
+        # The failed round linted the changed modules only; the passing one added the whole library.
+        self.assertEqual(outcome["verification"][0]["checks"]["lint"]["scope"], "changed")
+        self.assertEqual(outcome["verification"][-1]["checks"]["lint"]["scope"], "full")
+        changed = outcome["verification"][-1]["checks"]["changed_lint"]
+        self.assertEqual((changed["rc"], changed["modules"]), (0, 3))
+        self.assertEqual(
+            (self.stub_dir / "lint-runs.log").read_text().splitlines(),
+            [
+                "1 TauCeti.One TauCeti.Three TauCeti.Two",
+                "1 TauCeti.One TauCeti.Three TauCeti.Two",
+                "0 TauCeti.A TauCeti.One TauCeti.Three TauCeti.Two",
+            ],
+        )
+
+    def test_a_changed_only_driver_failure_falls_back_to_the_whole_library_lint(self):
+        # Batch 465's tip: the changed-only docstring-scan driver could not compile its module list.
+        self.findings(
+            "lint-driver-failure",
+            "DocScanDriver.lean:3436:0: error: maximum recursion depth reached in the code generator\n"
+            "::error::lint-env: driver failure: the docstring-scan driver did not elaborate cleanly\n"
+            "LINT-ENV: FAIL \u2014 driver failure: the docstring-scan driver did not elaborate cleanly",
+        )
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.service.results), 1, outcome)
+        [verification] = outcome["verification"]
+        self.assertTrue(verification["ok"], verification)
+        checks = verification["checks"]
+        self.assertEqual(checks["lint"]["scope"], "full")
+        self.assertEqual(checks["lint"]["findings"], 0)
+        self.assertEqual(
+            (checks["changed_lint"]["rc"], checks["changed_lint"]["modules"], checks["changed_lint"]["skipped"]),
+            (1, 3, "driver_failure"),
+        )
+        self.assertEqual(
+            (self.stub_dir / "lint-runs.log").read_text().splitlines(),
+            ["1 TauCeti.One TauCeti.Three TauCeti.Two", "0 TauCeti.A TauCeti.One TauCeti.Three TauCeti.Two"],
+        )
+
+    def test_the_driver_failure_fallback_runs_even_when_another_check_fails(self):
+        self.findings("lint-driver-failure", "LINT-ENV: FAIL \u2014 driver failure: report parsing failed")
+        self.findings("audit-findings", DUPLICATE_LINE)
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        first = outcome["verification"][0]["checks"]
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual((first["lint"]["scope"], first["lint"]["findings"]), ("full", 0))
+        # The agent sees the duplicate, not a lint failure it cannot act on.
+        prompt = self.agent_calls()[1]["prompt"]
+        self.assertIn(DUPLICATE_LINE, prompt)
+        self.assertNotIn("driver failure", prompt)
+
+    def test_a_changed_lint_too_large_for_the_driver_runs_the_whole_library_lint_instead(self):
+        with patch.object(repair_audit, "CHANGED_LINT_MODULE_LIMIT", 2):
+            cfg = self.config()
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        [verification] = outcome["verification"]
+        self.assertTrue(verification["ok"], verification)
+        self.assertEqual(verification["checks"]["lint"]["scope"], "full")
+        self.assertEqual(verification["checks"]["changed_lint"], {"skipped": "module_limit", "modules": 3})
+        # One lint, the whole library's: the changed-only driver never ran.
+        self.assertEqual(
+            (self.stub_dir / "lint-runs.log").read_text().splitlines(),
+            ["0 TauCeti.A TauCeti.One TauCeti.Three TauCeti.Two"],
+        )
 
     def test_a_finding_that_persists_is_never_submitted(self):
         self.findings("audit-findings-always", DUPLICATE_LINE)
@@ -6509,6 +6716,9 @@ class StreamAudits(WorkerAudits):
     test_a_finding_that_persists_is_never_submitted = None
     test_without_the_setting_nothing_is_checked = None
     test_the_build_helper_runs_the_audits_after_a_green_whole_library_build = None
+    test_a_changed_only_driver_failure_falls_back_to_the_whole_library_lint = None
+    test_the_driver_failure_fallback_runs_even_when_another_check_fails = None
+    test_a_changed_lint_too_large_for_the_driver_runs_the_whole_library_lint_instead = None
 
 
 class BuildScript(unittest.TestCase):
@@ -6525,7 +6735,7 @@ class BuildScript(unittest.TestCase):
     }
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="scoped-build-", dir=TMP))
+        self.root = scratch(self, "scoped-build-")
         for name, text in self.LIBRARY.items():
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text(text)
@@ -6647,7 +6857,7 @@ class RepairContextTests(unittest.TestCase):
     def chain_repo(self, prefix: str, base_files: dict[str, str], members: dict[int, dict[str, str]]):
         """A repository whose ``main`` is ``base_files`` and then one squash commit per member, in
         number order, checked out detached at the tip; ``(repo, base, chain)``."""
-        repo = Path(tempfile.mkdtemp(prefix=prefix, dir=TMP)) / "repo"
+        repo = scratch(self, prefix) / "repo"
         subprocess.run(["git", "init", "--quiet", "-b", "main", str(repo)], check=True)
         sh(repo, "config", "user.name", "Fixture")
         sh(repo, "config", "user.email", "fixture@example.invalid")

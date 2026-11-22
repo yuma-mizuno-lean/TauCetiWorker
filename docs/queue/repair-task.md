@@ -197,7 +197,7 @@ build from there. A task with a retained repair checkpoint is already on the tar
 a chain.
 
 **Resuming after a stop.** Each accepted resolution is recorded in the worker's clone as
-`refs/tauceti-queue/resolutions/<task_id>/<conflicting commit>-<clean prefix tree>`, naming the
+`refs/tauceti-queue/batch-resolutions/<batch_id>/<conflicting commit>-<clean prefix tree>`, naming the
 resolved commit (`repair_task.store_resolution`). The repair workers share one clone
 (`repair-clone`), so whichever worker claims the task next, after a stop (`worker-stopped`), a lost
 claim or a release such as `inference_unavailable`, finds them, and the ref keeps the objects. The
@@ -211,10 +211,19 @@ continues from it and the agent is not run for that conflict (the outcome's `con
 prefix with this tree, was not made exactly as the worker makes one (author, committer and dates, so
 not a commit an agent made with `git commit`), or fails a check is deleted and the conflict goes to the
 agent as before. The agent still sees one commit and never replays. A worker whose claim was lost
-records nothing. The task's entries are deleted once the service has
-answered its submission, and when the whole chain fails the worker's local checks (a rerun would
-rebuild the same chain without the agent). Entries of a task that is never claimed again stay in the
-clone like its `refs/tauceti-queue/task/<id>/...` refs; they are a few commit objects.
+records nothing.
+
+The entries belong to the batch, not the task, so a later task of the batch reuses them too: a
+pre-rebase superseded at the head's landing, or released, leaves its resolutions for the task that
+replaces it onto another tip. The conflicting commit in the key fixes the member's change and its
+parent; an entry made on another prefix is reused only when that prefix has the current prefix's
+content in every path the commit or the resolution changes (`repair_task.applicable_resolution`), so
+the conflict it resolved is this one. Its change is merged onto the current prefix and checked as
+above. The lookahead skips a member with such an entry on `onto`. The batch's entries are deleted once
+the service has answered a submission of one of its rebase tasks, and when the whole chain fails the
+worker's local checks (a rerun would rebuild the same chain without the agent). Entries of a batch
+that is never claimed again stay in the clone like its `refs/tauceti-queue/task/<id>/...` refs; they
+are a few commit objects.
 
 `Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,
 `violations` (chain tool findings, `{code, detail, commit, source_pr}`), `provenance`. The runner
@@ -483,10 +492,22 @@ has a time budget holds because the service re-exposes the task.
    where the worker does not own final verification, the agent's full-library helper) it runs every check
    staging runs, all at once: the `audit-driver` under `lake env timeout 3000s` (import of every TauCeti
    module, duplicate declarations, axioms), the module-system check (`ModuleSystem.lean`), `lint-env.sh`
-   with the `lint-env-driver` over the full library, `lint-style.sh` (Mathlib's text linters and the
+   with the `lint-env-driver`, `lint-style.sh` (Mathlib's text linters and the
    header check) and `lint-dot-notation.py` against its baseline. Every task, head or background, gets
-   the same set; there is no check owner and nothing is deferred to staging. Without a frozen
-   GitHub scope-policy snapshot the worker uses staging's conservative full-lint fallback. The sources are the TauCetiTools pin
+   the same set; there is no check owner and nothing is deferred to staging. The environment lint
+   first covers only the TauCeti modules changed since the base (`LINT_ONLY_MODULES` with
+   `LINT_CHANGED_ONLY=1`, an ordinary PR's preflight scope), whose time follows the changed
+   declarations rather than the whole library's 20 minutes. When that round finds nothing in any
+   check, the whole-library lint runs before the checks pass, so `passed` always includes it, and
+   `lint.scope` is `changed` only in a
+   failed round (`changed_lint` records the changed-module run of a passing one). The whole-library
+   lint takes the changed-only run's place in two cases, recorded as `changed_lint.skipped`: more than
+   `CHANGED_LINT_MODULE_LIMIT` (1,500) changed modules (`module_limit`), since `lint-env.sh` writes the
+   selected modules into one array literal that Lean's code generator rejects a little under 3,000
+   elements, and a changed-only run that ends in a `lint-env.sh` driver failure (`LINT-ENV: FAIL` naming `driver failure`) with no finding
+   naming a module (`driver_failure`), whatever the other checks found. A finding outside
+   the changed modules, such as a new simp lemma breaking an unchanged declaration's simp normal
+   form, therefore surfaces in that final lint and costs another round. The sources are the TauCetiTools pin
    the worktree's `tauceti.toml` names (`[tools.tools] repo`, `ref`): fetched once into
    `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and the worktree's
    `scripts/` as policy directory into `.lake/tauceti-repair-audit/scripts`, with both drivers compiled by the
@@ -932,6 +953,6 @@ chain and records it as a retained submission without adopting it. A new claim o
 starts from that tip and receives the outstanding findings. It runs full verification before final
 submission. The old worktree is removed once the checkpoint receipt is confirmed.
 
-When a pre-rebase passes full verification, the worker reports the verified tip, parent and tools
-pin with its submission. A matching result counts as preparation for that tip. A changed chain
-gets its own preparation and staging still makes the landing decision.
+When a pre-rebase passes full verification, including the whole-library lint, the worker reports
+the verified tip, parent and tools pin with its submission. A matching result counts as
+preparation for that tip. A changed chain gets its own preparation and staging still makes the landing decision.

@@ -302,6 +302,23 @@ from its cached observation or left for a later survey; a survey never falls bac
 reading every PR. Explicit `--pr` targets are read in full. A selected-state refresh
 replaces that PR's row in the shared listing instead of expiring it.
 
+Forgejo renders each listed PR with git work (its head, base and diff stat), so a full
+listing of about 1,300 open PRs costs the server minutes. Only the first survey on a host
+lists in full. When the shared listing expires or a write invalidates it, the next survey
+refreshes the stored one: PRs closed since then come from the issue index (no git work),
+changed PRs from the update-ordered listing until it reaches older PRs, and one more page of
+the creation-ordered listing, a different page each refresh. That page turn catches what
+moves no update time, such as mergeability after `main` moves, within one pass over all
+pages (about 26 refreshes); at the end of a pass, PRs the issue index no longer lists as
+open are dropped. A refresh reads about four pages where a full listing reads 27.
+
+A round's agent answers `gh pr list --json ...` from the same shared listing when it asks
+for open PRs and only fields the listing holds. Other states (or other fields) come from
+the issue index, which Forgejo serves without per-PR git work; there `merged` includes PRs
+the queue landed (closed under the `[Merged by Bors] - ` prefix), and `closed` excludes
+them. Filters such as `--author` or `--label`, other fields and table output still go
+through the native pull listing.
+
 Native `build` statuses are excluded from source survey CI classification. Native
 false mergeability remains unknown. This inventory provides no verified execution,
 claim or publication authority: its queues and next automatic stage remain empty,

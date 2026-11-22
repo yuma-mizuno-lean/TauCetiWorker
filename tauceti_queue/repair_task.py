@@ -9,7 +9,7 @@ tip's build outputs to the workers' own cache namespace (``repair_publish``), wh
 Task protocol (``docs/queue/repair-task.md``), all JSON over HTTP with
 ``Authorization: Bearer <GitHub token of the worker's account>``:
 
-- ``POST /tasks/claim`` ``{worker}`` returns 204 when nothing is claimable, else the controller's
+- ``POST /tasks/claim`` ``{worker, revision}`` returns 204 when nothing is claimable, else the controller's
   ``Task`` record (``tauceti_queue/ports.py``: ``task_id``, ``kind``, ``base``, ``tip``, ``onto``,
   ``members``, ``diagnostics``, ``retained_refs``, ``submission_ref``, ``claim_token``, ``expires_at``,
   ``instruction``);
@@ -97,9 +97,10 @@ from tauceti_queue.task_identity import (
 SCHEMA = "tauceti-queue.repair-task/v1"
 RESULT_REF_PREFIX = "refs/tauceti-queue/task"
 SUBMISSION_PREFIX = "refs/tauceti-queue/submissions"
-# A rebase task's accepted conflict resolutions, kept until the task is answered so a rerun resumes after
-# them: ``<prefix>/<task_id>/<conflicting commit>-<clean prefix tree>`` (``store_resolution``).
-RESOLUTION_PREFIX = "refs/tauceti-queue/resolutions"
+# A batch's accepted conflict resolutions, kept until one of its rebase tasks is answered so a rerun or a
+# later task of the batch resumes after them:
+# ``<prefix>/<batch_id>/<conflicting commit>-<clean prefix tree>`` (``store_resolution``).
+RESOLUTION_PREFIX = "refs/tauceti-queue/batch-resolutions"
 # ``prepare`` builds an open batch on its own base and repairs what fails before the batch is the head.
 TASK_KINDS = ("repair", *repair.REBASE_KINDS, "prepare")
 RELEASE_REASONS = (
@@ -528,6 +529,8 @@ class TaskClient:
 
     def claim(self) -> Task | None:
         body = {"worker": self.worker}
+        if re.fullmatch(r"[0-9a-f]{7,64}", STARTUP_REVISION or ""):
+            body["revision"] = STARTUP_REVISION  # a stalled repair is offered at once to code that has not tried it
         if self.binding is None:
             from .mixed_tasks import SCHEMA
 
@@ -1710,6 +1713,16 @@ def rejected_members(response: dict) -> list[str]:
     return members
 
 
+def last_agent_conclusion(agent_records: list[dict], limit: int = 2000) -> str | None:
+    """The last agent attempt's final message (what it concluded about the task), cut to ``limit``."""
+    for record in reversed(agent_records or []):
+        for attempt in reversed((record or {}).get("attempts") or []):
+            text = (attempt or {}).get("final_text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()[:limit]
+    return None
+
+
 def read_telemetry(logdir: Path, provider: str) -> dict:
     from tauceti_worker.runtime_status import read_json
 
@@ -2029,6 +2042,7 @@ def run_repair_agent(
                 "session": session,
                 "infrastructure_failure": reason,
                 "telemetry": read_telemetry(logdir, telemetry_provider),
+                "final_text": (run or {}).get("final_text"),
             }
             usage = (record["telemetry"] or {}).get("usage") or {}
             record["estimated_cost_usd"] = repair.price_usage(
@@ -2469,18 +2483,24 @@ def resolve_conflicts(
             accept = accepter(source_pr, prefix, commit)
             paths = list(conflict.conflict_paths)
             reuse = None
-            stored = stored_resolution(cfg.clone, task.task_id, commit, prefix)
+            stored = stored_resolution(cfg.clone, task.batch_id, commit, prefix)
             if stored is not None:
-                # An earlier run of this task (on any worker sharing the clone) accepted a resolution of
-                # this commit on this prefix; it goes through the same checks as a fresh one.
+                # An earlier run of a task of this batch (on any worker sharing the clone) accepted a
+                # resolution of this commit on this prefix; it goes through the same checks as a fresh one.
                 reuse = ("reused", stored, None)
             else:
                 if lookahead is not None:
                     lookahead.wait(commit)
-                ahead = stored_resolution(cfg.clone, task.task_id, commit, task.onto)
+                ahead = stored_resolution(cfg.clone, task.batch_id, commit, task.onto)
                 if ahead is not None:
                     # Resolved on `onto` alone by the lookahead: its change merged onto this prefix.
                     reuse = ("lookahead", ahead, task.onto)
+                else:
+                    # Resolved by an earlier task of the batch on another prefix with the same inputs,
+                    # such as a pre-rebase onto an earlier tip of the head.
+                    earlier = applicable_resolution(cfg.clone, task.batch_id, commit, prefix)
+                    if earlier is not None:
+                        reuse = ("reused", earlier, git(cfg.clone, "rev-parse", f"{earlier}^").strip())
             if reuse is not None:
                 how, sha, made_on = reuse
                 recommitted = repair.recommit_resolution(
@@ -2492,15 +2512,15 @@ def resolve_conflicts(
                     state.write("conflict_validated", conflict=source_pr, attempt=0, tip=tip, report=report)
                     if rest is not None:
                         log(
-                            f"task {task.task_id}: {'reusing the stored' if made_on is None else 'using the lookahead'} resolution of {source_pr}'s commit {commit[:12]}"
+                            f"task {task.task_id}: {'reusing the stored' if how == 'reused' else 'using the lookahead'} resolution of {source_pr}'s commit {commit[:12]}"
                         )
                         if made_on is not None and not cancel.is_set():
-                            store_resolution(cfg.clone, task.task_id, commit, prefix, tip)
+                            store_resolution(cfg.clone, task.batch_id, commit, prefix, tip)
                         resolved.append({"source_pr": source_pr, "commit": commit, "resolved": tip, how: True})
                         result = rest
                         continue
-                if made_on is None:
-                    forget_resolutions(cfg.clone, task.task_id, sha)
+                if how == "reused":
+                    forget_resolutions(cfg.clone, task.batch_id, sha)
                 else:
                     log(
                         f"task {task.task_id}: the lookahead resolution of {source_pr} does not compose; resolving it here"
@@ -2536,7 +2556,7 @@ def resolve_conflicts(
                 return {**outcome, "resolved": resolved}
             agent = outcome.get("agent") or agent
             if not cancel.is_set():  # a worker that lost its claim records nothing for the next claimant
-                store_resolution(cfg.clone, task.task_id, commit, prefix, outcome["tip"])
+                store_resolution(cfg.clone, task.batch_id, commit, prefix, outcome["tip"])
             resolved.append(
                 {"source_pr": source_pr, "commit": commit, "resolved": outcome["tip"]}
                 | ({"numproj": True} if outcome.get("numproj") else {})
@@ -2695,40 +2715,78 @@ def resolve_one(
     return {"status": "agent_failed", "reason": f"{source_pr}: the conflict stays unresolved\n{format_report(report)}"}
 
 
-def resolution_ref(task_id: str, commit: str, prefix_tree: str) -> str:
-    return f"{RESOLUTION_PREFIX}/{task_id}/{commit}-{prefix_tree}"
+def resolution_ref(batch_id: str, commit: str, prefix_tree: str) -> str:
+    return f"{RESOLUTION_PREFIX}/{batch_id}/{commit}-{prefix_tree}"
 
 
-def stored_resolution(clone: Path, task_id: str, commit: str, prefix: str) -> str | None:
-    """The resolved commit an earlier run of task ``task_id`` accepted for ``commit`` on a clean prefix
-    with ``prefix``'s tree (``store_resolution``), or None. Keyed by the tree because the replay dates
-    its commits when it runs: a rerun reaches the same prefix tree under another SHA."""
-    ref = resolution_ref(task_id, commit, chain_tool.tree_of(clone, prefix))
+def stored_resolution(clone: Path, batch_id: str, commit: str, prefix: str) -> str | None:
+    """The resolved commit an earlier run of a task of batch ``batch_id`` accepted for ``commit`` on a
+    clean prefix with ``prefix``'s tree (``store_resolution``), or None. Keyed by the tree because the
+    replay dates its commits when it runs: a rerun reaches the same prefix tree under another SHA."""
+    ref = resolution_ref(batch_id, commit, chain_tool.tree_of(clone, prefix))
     sha = git(clone, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False).strip()
     return sha or None
 
 
-def store_resolution(clone: Path, task_id: str, commit: str, prefix: str, resolved: str) -> None:
-    """Record an accepted resolution in the shared clone, so a rerun of the task after a stop resumes
-    after it (``stored_resolution``); the ref also keeps its objects. Never fails the task."""
+def changed_paths(clone: Path, old: str, new: str) -> dict[str, str]:
+    """``git diff --raw`` from ``old`` to ``new``: each changed path's line, without rename detection."""
+    listing = git(clone, "diff", "--raw", "--no-renames", "-z", old, new, check=False).split("\0")
+    return dict(zip(listing[1::2], listing[0::2], strict=False))
+
+
+def applicable_resolution(clone: Path, batch_id: str, commit: str, prefix: str) -> str | None:
+    """A stored resolution of ``commit`` by any task of batch ``batch_id``, on any prefix, of the conflict
+    ``commit`` has on ``prefix``, or None. The key's commit fixes the conflicting change and its parent.
+    The prefix it was made on is the same as ``prefix`` in the conflicting paths and in every path the
+    resolution changes, and cherry-picking ``commit`` onto either conflicts in the same paths and
+    otherwise differs only as the two prefixes do (no change of ``commit`` lands elsewhere, as after a
+    directory rename), so the conflict it resolved is this one."""
+    stored = git(
+        clone, "for-each-ref", "--format=%(objectname)", f"{RESOLUTION_PREFIX}/{batch_id}/{commit}-*", check=False
+    ).split()
+    if not stored:
+        return None
+    here = chain_tool.merge_trees(clone, prefix, commit, merge_base=f"{commit}^")
+    conflicting = set(here.conflict_paths)
+    for sha in stored:
+        made_on = git(clone, "rev-parse", "--verify", "--quiet", f"{sha}^", check=False).strip()
+        if not made_on:
+            continue
+        there = chain_tool.merge_trees(clone, made_on, commit, merge_base=f"{commit}^")
+        differ = changed_paths(clone, made_on, prefix)
+        if (
+            set(there.conflict_paths) == conflicting
+            and not differ.keys() & (conflicting | changed_paths(clone, made_on, sha).keys())
+            and differ
+            == {p: line for p, line in changed_paths(clone, there.tree, here.tree).items() if p not in conflicting}
+        ):
+            return sha
+    return None
+
+
+def store_resolution(clone: Path, batch_id: str, commit: str, prefix: str, resolved: str) -> None:
+    """Record an accepted resolution in the shared clone, so a rerun of the task after a stop, or a later
+    task of the batch, resumes after it (``stored_resolution``, ``applicable_resolution``); the ref also
+    keeps its objects. Never fails the task."""
     try:
-        git(clone, "update-ref", resolution_ref(task_id, commit, chain_tool.tree_of(clone, prefix)), resolved)
+        git(clone, "update-ref", resolution_ref(batch_id, commit, chain_tool.tree_of(clone, prefix)), resolved)
     except Exception as error:  # noqa: BLE001 - losing the record only costs the resume
-        log(f"task {task_id}: could not record the resolution of {commit[:12]}: {error}")
+        log(f"batch {batch_id}: could not record the resolution of {commit[:12]}: {error}")
 
 
-def forget_resolutions(clone: Path, task_id: str, only: str | None = None) -> None:
-    """Delete task ``task_id``'s stored resolutions (``only``: the entries naming that commit). Never fails."""
+def forget_resolutions(clone: Path, batch_id: str, only: str | None = None) -> None:
+    """Delete batch ``batch_id``'s stored resolutions (``only``: the entries naming that commit). Never
+    fails."""
     try:
         listing = git(
-            clone, "for-each-ref", "--format=%(refname) %(objectname)", f"{RESOLUTION_PREFIX}/{task_id}/", check=False
+            clone, "for-each-ref", "--format=%(refname) %(objectname)", f"{RESOLUTION_PREFIX}/{batch_id}/", check=False
         )
         for line in listing.splitlines():
             ref, _, sha = line.partition(" ")
             if only is None or sha == only:
                 git(clone, "update-ref", "-d", ref, sha, check=False)
     except Exception as error:  # noqa: BLE001
-        log(f"task {task_id}: could not delete its stored resolutions: {error}")
+        log(f"batch {batch_id}: could not delete its stored resolutions: {error}")
 
 
 def conflict_findings(task: Task, entry: dict, prs: set) -> dict:
@@ -2765,16 +2823,29 @@ def absorbed_members(
     the clean ``prefix`` and changes it, the resolved commit already holds it (applying it there
     changes nothing), and the conflicting commit did not carry it in the input chain. Taking a later
     member's content is replaying it by hand, and would leave that member an empty commit. A member
-    that conflicts with the prefix is not judged; content moved in part is not detected mechanically."""
-    landed = {r.source_pr for r in rest.commits if r.landed_on_base}
+    that conflicts with the prefix is not judged; content moved in part is not detected mechanically.
+
+    Only a later member that changes a path the resolution changes on the prefix is judged: where the
+    prefix and the resolved commit agree on every path a member changes, applying it changes both
+    alike, so one cannot hold it while the other does not. (Git's rename detection could carry a
+    member's edit to a path the resolution added; like content moved in part, that is not judged.)
+    Merging every later member instead took about 20 s per conflict on a 1,014-member batch, about
+    half an hour over its 212 conflicts."""
     prefix_tree = chain_tool.tree_of(clone, prefix)
     resolved_tree = chain_tool.tree_of(clone, resolved)
+    if resolved_tree == prefix_tree:
+        return []  # the resolution leaves the prefix as it is, so applying a member changes both alike
     original_tree = chain_tool.tree_of(clone, commit)
+    touched = set(chain_tool.git(clone, "diff", "--name-only", "--no-renames", "-z", prefix, resolved).split("\0"))
+    touched.discard("")
+    landed = {r.source_pr for r in rest.commits if r.landed_on_base}
+    later_commits = chain_tool.chain_commits(clone, commit, tip)
+    paths = chain_tool.commit_paths(clone, [c.sha for c in later_commits])
     problems = []
-    for later in chain_tool.chain_commits(clone, commit, tip):
+    for later in later_commits:
+        if later.source_pr in landed or paths[later.sha].isdisjoint(touched):
+            continue  # landed, empty, or applies alike onto the prefix and the resolution
         parent = later.parents[0]
-        if later.source_pr in landed or later.tree == chain_tool.tree_of(clone, parent):
-            continue
         onto_prefix = chain_tool.merge_trees(clone, prefix, later.sha, merge_base=parent)
         if not onto_prefix.clean or onto_prefix.tree == prefix_tree:
             continue
@@ -3342,9 +3413,10 @@ def _run_task(
                     git(worktree, "checkout", "--quiet", "--force", "--detach", rebased_tip)
                     tip, report = rebased_tip, rebased_report
                 else:
-                    if rebased:
-                        # A rerun would rebuild this chain from the stored resolutions without the agent.
-                        forget_resolutions(cfg.clone, task.task_id)
+                    if rebased and not cancel.is_set():
+                        # A rerun would rebuild this chain from the stored resolutions without the agent. A
+                        # worker that lost its claim leaves them to the claimant.
+                        forget_resolutions(cfg.clone, task.batch_id)
                     return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             parallel = outcome.get("parallel") or {}
             verified = (
@@ -3427,6 +3499,9 @@ def _run_task(
                                 {**finding, "message": finding["message"][:2000]}
                                 for finding in verification["diagnostics"][:20]
                             ],
+                            "tools": checks.get("tools_commit") or checks.get("tools"),
+                            # The code that produced it, kept if a later process delivers it.
+                            "worker_revision": STARTUP_REVISION,
                         }
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
@@ -3469,12 +3544,14 @@ def _run_task(
                 for result in reversed(outcome.get("verification", [])):
                     checks = result.get("checks") or {}
                     if result.get("tip") == tip and result.get("ok") is True and checks.get("status") == "passed":
-                        notes["pre_rebase_verification"] = {
-                            "tip": tip,
-                            "base": task.validation_base,
-                            "tools": checks.get("tools"),
-                            "scope": "full",
-                        }
+                        scope = (checks.get("lint") or {}).get("scope")
+                        if scope == "full":
+                            notes["pre_rebase_verification"] = {
+                                "tip": tip,
+                                "base": task.validation_base,
+                                "tools": checks.get("tools"),
+                                "scope": scope,
+                            }
                         break
             if task.kind == "prepare":
                 notes["remaining_errors"] = prepare_remaining_errors(outcome.get("parallel"), findings, worktree)
@@ -3483,6 +3560,14 @@ def _run_task(
             submit_options = {"checkpoint": True} if saving_checkpoint else {}
             if saving_checkpoint:
                 notes["repair_checkpoint"] = checkpoint["diagnostics"]
+                # What the queue's stall detection reads (docs/queue/escalation.md, "Stalled repair"): the
+                # code that produced the checkpoint and the agent's own conclusion about it.
+                notes["worker_revision"] = checkpoint.get("worker_revision") or STARTUP_REVISION
+                if checkpoint.get("tools"):
+                    notes["tools_revision"] = checkpoint["tools"]
+                conclusion = last_agent_conclusion(agent_records)
+                if conclusion:
+                    notes["agent_conclusion"] = conclusion
             lease.submitting.set()
             try:
                 response = with_retries(
@@ -3498,10 +3583,12 @@ def _run_task(
             except ServiceError as error:
                 return defer_delivery(f"result response unavailable: {error}")
             state.write("submitted", attempt=attempt, response=response)
-            if rebased:
-                forget_resolutions(cfg.clone, task.task_id)  # the service has the chain: the task is answered
             outcome["response"] = response
             reason = str(response.get("reason") or "")
+            if rebased and reason not in CLAIM_CODES:
+                # The service has the chain: the task is answered. A refused claim's successor may be
+                # using the batch's resolutions.
+                forget_resolutions(cfg.clone, task.batch_id)
             if reason == REPAIR_CHECKPOINT:
                 lease.stop()
                 outcome.update(status="released", reason=REPAIR_CHECKPOINT, tip=tip, pushed_ref=push["ref"])
